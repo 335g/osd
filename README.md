@@ -10,14 +10,18 @@ AI の長い回答を、付箋と図で噛み砕いて理解するためのネ�
 | クレート | 役割 |
 |---|---|
 | `crates/osd-api` | ブリッジ API の型（サーバと GUI で共有） |
-| `crates/osd-server` | ブリッジ API サーバ。`pi` をフォークして付箋の質問に答える |
-| `crates/osd-app` | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)）。本筋・付箋・返す文まで動く |
+| `crates/osd-server` | ブリッジ API サーバ。1 セッションに絞り、`pi` をフォークして質問に答える |
+| `crates/osd-app` | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)）。発言の一覧と本文 |
 
 ## osd-server
 
 ```sh
-cargo run -p osd-server -- --dir <作業フォルダ> --session <本体セッション> [--cwd <プロジェクト>] [--host 127.0.0.1] [--port 8765]
+cargo run -p osd-server -- --session <セッションIDかファイル> [--dir <作業フォルダ>] [--cwd <プロジェクト>] [--host 127.0.0.1] [--port 8765]
 ```
+
+`--session` は ID（前方一致）でもファイルのパスでもよい。省略時は `PI_SESSION_FILE`。
+1 つのセッションだけを開き、その中のアシスタント発言を扱う。プロジェクトやセッションの
+一覧は持たない（headful で動いているセッションを 1 つ指定して開く使い方）。
 
 起動すると 1 行目に URL を出す。GUI（または `pi-understand` 拡張）はこれを読む。
 
@@ -25,8 +29,8 @@ cargo run -p osd-server -- --dir <作業フォルダ> --session <本体セッシ
 osd: http://127.0.0.1:8765/?t=<合言葉>
 ```
 
-`--dir` の中に `main.md`（本筋）と `title.txt` を置くと `/api/init` が返す。
-`/api/return` で `return.md` に書き、フォークを消して終了する。
+起動すると、そのセッションの最後のアシスタント発言が `main.md`（本筋）になる。
+`/api/open` で別の発言に切り替え、`/api/return` で `return.md` に書いてフォークを消し、終了する。
 
 ### API
 
@@ -35,9 +39,8 @@ osd: http://127.0.0.1:8765/?t=<合言葉>
 | エンドポイント | 入力 | 出力 |
 |---|---|---|
 | `GET /api/init` | — | `{markdown, title, hasSession, project}` |
-| `GET /api/sessions` | — | `{sessions, projects, note}`。動いているエージェントのプロジェクトとそのセッションだけ |
-| `POST /api/comments` | `{file}` | `{project, comments: [{index, preview, chars}]}`（そのセッションのアシスタント発言） |
-| `POST /api/open` | `{file, index?}` | `{markdown, ...}`。選んだアシスタント発言を本筋にする（index 省略＝最後） |
+| `GET /api/comments` | — | `{project, session, comments: [{index, preview, chars}], note}` |
+| `POST /api/open` | `{index?}` | `{markdown, ...}`。選んだアシスタント発言を本筋にする（index 省略＝最後） |
 | `POST /api/ask` | `{action, anchor, question}` / `{continueSession, forkFile, followUp}` | `{ok, text, sessionId, forkFile, costUsd}` |
 | `POST /api/draft` | `{notes}` | 同上（本筋に返す文の下書き） |
 | `POST /api/return` | `{text}` | `{ok}` |
@@ -57,7 +60,6 @@ cargo test -p osd-server
 
 - `OSD_PI_BIN` — `pi` のパス（既定 `pi`）
 - `OSD_TIMEOUT_SEC` — 1 問の待ち時間（既定 300）
-- `OSD_HC_BIN` — `hc` のパス（既定 `hc`）
 - `OSD_SESSIONS_DIR` — セッション置き場（既定 `~/.pi/agent/sessions`）
 
 ## osd-app
@@ -68,11 +70,8 @@ cargo run -p osd-app -- --url 'http://127.0.0.1:8765/?t=...'
 cargo run -p osd-app -- --scene note --snap /tmp/osd.png   # ヘッドレスで見た目確認
 ```
 
-左にプロジェクトの一覧（プロジェクト名・動いているエージェント数・セッション数・更新時刻）。
-一覧は全プロジェクトではなく、`hc ls --json`（herdr-core）が返す**いま動いているエージェントの
-プロジェクトだけ**。プロジェクトを押すと
-そのプロジェクトのセッションが下に開き（同時に開くのは 1 つ）、セッションを選ぶと右上に
-そのセッションのアシスタント発言の一覧、右下に選んだ発言の本文が出る。
+ブリッジが開いている 1 セッションのアシスタント発言を、新しい順に上に並べる。
+選んだ発言の本文が下に出る（既定は最後の発言）。
 
 ブリッジの URL は `--url`、`--dir`、`OSD_URL`、カレントの `url.txt` の順に探す。
 `--scene sample` はブリッジ無しで見た目を確かめる見本。

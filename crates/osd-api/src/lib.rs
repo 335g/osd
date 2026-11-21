@@ -96,53 +96,10 @@ pub struct OkResp {
     pub error: String,
 }
 
-/// リストに出す 1 セッション分の情報。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SessionInfo {
-    /// セッション ID（ファイル名の末尾 `_<id>.jsonl`）
-    pub id: String,
-    /// セッションファイルの絶対パス。`/api/open` に渡す
-    pub file: String,
-    pub cwd: String,
-    /// cwd の最後のディレクトリ名
-    pub project: String,
-    /// 更新時刻（Unix ミリ秒）
-    pub updated: u64,
-    /// 最初のユーザー発言（何を頼んだセッションか分かるように）
-    pub preview: String,
-}
-
-/// いま herdr-core で動いているエージェントのプロジェクト。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct ProjectInfo {
-    pub cwd: String,
-    /// cwd の最後のディレクトリ名
-    pub name: String,
-    /// このプロジェクトで動いているエージェントの数
-    pub agents: u32,
-    /// そのプロジェクトのセッション数
-    pub sessions: u32,
-    /// 一番新しいセッションの更新時刻（Unix ミリ秒）
-    pub updated: u64,
-}
-
-/// GET /api/sessions — 動いているエージェントのプロジェクトと、そのセッションだけ
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SessionsResp {
-    pub sessions: Vec<SessionInfo>,
-    pub projects: Vec<ProjectInfo>,
-    /// 一覧を作れなかった理由（空なら問題なし）
-    pub note: String,
-}
-
 /// POST /api/open — 選んだアシスタント発言を本筋にする（index 省略なら最後）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OpenReq {
-    pub file: String,
     /// セッション内の何番目のアシスタント発言か（0 始まり）
     pub index: Option<u32>,
 }
@@ -158,10 +115,14 @@ pub struct CommentMeta {
     pub chars: u32,
 }
 
-/// POST /api/comments
+/// GET /api/comments — 開いているセッションのアシスタント発言
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CommentsResp {
     pub project: String,
+    /// セッション ID
+    pub session: String,
     pub comments: Vec<CommentMeta>,
+    /// 読めなかった理由（空なら問題なし）
+    pub note: String,
 }

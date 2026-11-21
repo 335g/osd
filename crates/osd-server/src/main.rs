@@ -1,11 +1,11 @@
-//! osd ブリッジ API サーバ。付箋の質問を pi のフォークで処理し、本体セッションを汚さない。
+//! osd ブリッジ API サーバ。1 つのセッション（プロジェクト）に絞って、
+//! その中のアシスタント発言を「本筋」として扱う。付箋の質問は pi のフォークで答える。
 //!
-//! 使い方: osd-server --dir <作業フォルダ> --session <本体セッションIDかファイル> [--cwd <プロジェクト>] [--port 0] [--host 127.0.0.1]
+//! 使い方: osd-server --session <セッションIDかファイル> [--dir <作業フォルダ>] [--cwd <プロジェクト>] [--port 8765] [--host 127.0.0.1]
 //!
 //! 起動すると `osd: http://127.0.0.1:<port>/?t=<token>` を stdout に出し、同じ URL を
 //! `<作業フォルダ>/url.txt` に書く。GUI はこの URL を叩く。
 
-mod agents;
 mod pi;
 mod sessions;
 
@@ -19,21 +19,27 @@ use axum::{
 };
 use osd_api::{
     Action, AskReq, AskResp, CommentMeta, CommentsResp, DraftReq, InitResp, OkResp, OpenReq,
-    ProjectInfo, ReturnReq, SessionsResp,
+    ReturnReq,
 };
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
 const DEFAULT_TIMEOUT_SEC: u64 = 300;
 
+/// 開いているセッション。起動時に決まり、以後変わらない。
+struct Session {
+    file: PathBuf,
+    id: String,
+    project: String,
+}
+
 struct App {
     work_dir: PathBuf,
     fork_dir: PathBuf,
     project_cwd: PathBuf,
-    /// いま本筋にしているセッション（/api/open で差し替わる）
-    main_session: Mutex<Option<String>>,
+    session: Option<Session>,
     token: String,
     /// 同じマシンの別プロセス・別ページからの操作を断るための Host 許可リスト
     allowed_hosts: Vec<String>,
@@ -95,14 +101,27 @@ async fn run() -> Result<(), String> {
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SEC));
 
+    let session = resolve_session(&args);
+    if let Some(s) = &session {
+        // 最初は最後のアシスタント発言を本筋にしておく
+        if let Some(markdown) = sessions::last_assistant(&s.file) {
+            let _ = tokio::fs::write(work_dir.join("main.md"), &markdown).await;
+        }
+        let _ = tokio::fs::write(work_dir.join("title.txt"), format!("{}\n", s.project)).await;
+    }
+
     let app = Arc::new(App {
         work_dir: work_dir.clone(),
         fork_dir,
         project_cwd: match args.get("cwd") {
             Some(dir) => PathBuf::from(dir),
-            None => std::env::current_dir().map_err(|e| e.to_string())?,
+            None => session
+                .as_ref()
+                .map(|s| PathBuf::from(sessions::cwd_of(&s.file)))
+                .filter(|p| p.is_dir())
+                .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?),
         },
-        main_session: Mutex::new(args.get("session").cloned().filter(|s| !s.is_empty())),
+        session,
         token: token.clone(),
         allowed_hosts,
         timeout,
@@ -113,7 +132,10 @@ async fn run() -> Result<(), String> {
     write_handoff(&work_dir, &url, std::process::id()).await;
     println!("osd: {url}");
     println!("作業フォルダ: {}", work_dir.display());
-    println!("本体のセッション: {}", current_session(&app).unwrap_or_else(|| "(未指定)".into()));
+    match &app.session {
+        Some(s) => println!("セッション: {} ({})", s.project, s.file.display()),
+        None => println!("セッション: (未指定)"),
+    }
     println!("分身を動かす場所: {}", app.project_cwd.display());
 
     let router = routes(app.clone());
@@ -133,9 +155,8 @@ async fn run() -> Result<(), String> {
 fn routes(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/init", get(init))
-        .route("/api/sessions", get(list_sessions))
+        .route("/api/comments", get(comments))
         .route("/api/open", post(open))
-        .route("/api/comments", post(comments))
         .route("/api/ask", post(ask))
         .route("/api/draft", post(draft))
         .route("/api/return", post(close))
@@ -193,59 +214,40 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 }
 
 // ---------- ハンドラ ----------
-/// いま動いているエージェントのプロジェクトと、そのセッションだけを返す。
-async fn list_sessions() -> Json<SessionsResp> {
-    let base = sessions::dir();
-    let found = tokio::task::spawn_blocking(move || sessions::list(&base))
+async fn init(State(app): State<Arc<App>>) -> Json<InitResp> {
+    let mut markdown = tokio::fs::read_to_string(app.work_dir.join("main.md"))
         .await
-        .unwrap_or_default();
-    let running = match agents::running().await {
-        Ok(list) => list,
-        // hc が無い・落ちているときは、全プロジェクトを出さずに理由を返す
-        Err(e) => {
-            return Json(SessionsResp {
-                note: format!("動いているエージェントを取れませんでした: {e}"),
-                ..SessionsResp::default()
-            })
+        .unwrap_or_else(|_| "# 本筋がありません\n\nセッションを開いてください。".into());
+    let mut title = String::new();
+    if let Some(s) = &app.session {
+        title = s.project.clone();
+        if markdown.contains("本筋がありません") {
+            markdown = sessions::last_assistant(&s.file).unwrap_or(markdown);
         }
-    };
-    let mut projects = Vec::new();
-    for (cwd, name, count) in &running {
-        let mut mine: Vec<_> = found.iter().filter(|s| &s.cwd == cwd).collect();
-        mine.sort_by(|a, b| b.updated.cmp(&a.updated));
-        projects.push(ProjectInfo {
-            cwd: cwd.clone(),
-            name: name.clone(),
-            agents: *count,
-            sessions: mine.len() as u32,
-            updated: mine.first().map(|s| s.updated).unwrap_or(0),
-        });
     }
-    // 動いているプロジェクトだけを、セッションが新しい順に
-    projects.sort_by(|a, b| b.updated.cmp(&a.updated));
-    let sessions: Vec<_> = found
-        .into_iter()
-        .filter(|s| running.iter().any(|(cwd, _, _)| cwd == &s.cwd))
-        .collect();
-    Json(SessionsResp {
-        sessions,
-        projects,
-        note: String::new(),
+    Json(InitResp {
+        markdown,
+        title,
+        has_session: app.session.is_some(),
+        project: app.session.as_ref().map(|s| s.project.clone()).unwrap_or_default(),
     })
 }
 
-/// セッション内のアシスタント発言の一覧（一覧に出す分だけ）。
-async fn comments(Json(body): Json<OpenReq>) -> Json<CommentsResp> {
-    let base = sessions::dir();
-    let Some(file) = sessions::resolve(&base, &body.file) else {
-        return Json(CommentsResp::default());
+/// 開いているセッションのアシスタント発言の一覧。
+async fn comments(State(app): State<Arc<App>>) -> Json<CommentsResp> {
+    let Some(session) = &app.session else {
+        return Json(CommentsResp {
+            note: "セッションが指定されていません（--session で渡してください）".into(),
+            ..CommentsResp::default()
+        });
     };
-    let project = project_of(&file);
+    let file = session.file.clone();
     let messages = tokio::task::spawn_blocking(move || sessions::assistant_messages(&file))
         .await
         .unwrap_or_default();
     Json(CommentsResp {
-        project,
+        project: session.project.clone(),
+        session: session.id.clone(),
         comments: messages
             .iter()
             .enumerate()
@@ -255,36 +257,33 @@ async fn comments(Json(body): Json<OpenReq>) -> Json<CommentsResp> {
                 chars: text.chars().count() as u32,
             })
             .collect(),
+        note: String::new(),
     })
 }
 
-/// 選んだアシスタント発言を本筋にして、以後の分岐元にする。
+/// 選んだアシスタント発言を本筋にする（index 省略なら最後）。
 async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenReq>) -> Json<InitResp> {
-    let base = sessions::dir();
-    let Some(file) = sessions::resolve(&base, &body.file) else {
+    let Some(session) = &app.session else {
         return Json(InitResp {
-            markdown: "セッションのファイルが指定の場所にありません".into(),
+            markdown: "セッションが指定されていません（--session で渡してください）".into(),
             ..InitResp::default()
         });
     };
-    let text = tokio::task::spawn_blocking({
-        let file = file.clone();
-        let index = body.index;
-        move || match index {
-            Some(i) => sessions::assistant_messages(&file).get(i as usize).cloned(),
-            None => sessions::last_assistant(&file),
-        }
+    let file = session.file.clone();
+    let index = body.index;
+    let text = tokio::task::spawn_blocking(move || match index {
+        Some(i) => sessions::assistant_messages(&file).get(i as usize).cloned(),
+        None => sessions::last_assistant(&file),
     })
     .await
     .ok()
     .flatten();
-
     let Some(markdown) = text else {
         return Json(InitResp {
             markdown: "このセッションにはアシスタントの発言がありません".into(),
+            title: session.project.clone(),
             has_session: true,
-            project: project_of(&file),
-            title: String::new(),
+            project: session.project.clone(),
         });
     };
     if let Err(e) = tokio::fs::write(app.work_dir.join("main.md"), &markdown).await {
@@ -293,47 +292,11 @@ async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenReq>) -> Json<In
             ..InitResp::default()
         });
     }
-    let project = project_of(&file);
-    let _ = tokio::fs::write(app.work_dir.join("title.txt"), format!("{project}\n")).await;
-    *app.main_session.lock().unwrap() = Some(file.to_string_lossy().into_owned());
     Json(InitResp {
         markdown,
-        title: project.clone(),
+        title: session.project.clone(),
         has_session: true,
-        project,
-    })
-}
-
-fn current_session(app: &Arc<App>) -> Option<String> {
-    app.main_session.lock().unwrap().clone()
-}
-
-fn project_of(file: &Path) -> String {
-    Path::new(&sessions::cwd_of(file))
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-async fn init(State(app): State<Arc<App>>) -> Json<InitResp> {
-    let md = app.work_dir.join("main.md");
-    let markdown = tokio::fs::read_to_string(&md)
-        .await
-        .unwrap_or_else(|_| "# 本筋がありません\n\nmain.md が見つかりませんでした。".into());
-    let title = tokio::fs::read_to_string(app.work_dir.join("title.txt"))
-        .await
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
-    let project = app
-        .project_cwd
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Json(InitResp {
-        markdown,
-        title,
-        has_session: current_session(&app).is_some(),
-        project,
+        project: session.project.clone(),
     })
 }
 
@@ -342,9 +305,7 @@ async fn ask(State(app): State<Arc<App>>, Json(body): Json<AskReq>) -> Json<AskR
     let parent = if body.continue_session {
         Some(body.fork_file.clone()).filter(|s| !s.is_empty())
     } else {
-        current_session(&app)
-            .or_else(|| Some(body.session_id.clone()))
-            .filter(|s| !s.is_empty())
+        session_file(&app).or_else(|| Some(body.session_id.clone()).filter(|s| !s.is_empty()))
     };
     let Some(parent) = parent else {
         return Json(AskResp::err("本体のセッションが見つかりません。起動し直してください。"));
@@ -378,7 +339,7 @@ async fn ask(State(app): State<Arc<App>>, Json(body): Json<AskReq>) -> Json<AskR
 }
 
 async fn draft(State(app): State<Arc<App>>, Json(body): Json<DraftReq>) -> Json<AskResp> {
-    let Some(session) = current_session(&app) else {
+    let Some(session) = session_file(&app) else {
         return Json(AskResp::err("本体のセッションが見つかりません。"));
     };
     let prompt = [
@@ -434,6 +395,34 @@ async fn close(State(app): State<Arc<App>>, Json(body): Json<ReturnReq>) -> Json
     // 応答を返してから終わる（axum の graceful shutdown が処理中の応答を待つ）
     app.shutdown.notify_waiters();
     Json(resp)
+}
+
+// ---------- セッションの解決 ----------
+/// `--session` にファイルか ID（前方一致）を渡せる。無ければ PI_SESSION_FILE。
+fn resolve_session(args: &std::collections::HashMap<String, String>) -> Option<Session> {
+    let given = args
+        .get("session")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("PI_SESSION_FILE").ok().filter(|s| !s.is_empty()))?;
+    let path = PathBuf::from(&given);
+    let file = if path.is_file() {
+        std::fs::canonicalize(&path).ok()?
+    } else {
+        sessions::find(&sessions::dir(), &given)?
+    };
+    let id = sessions::id_of(&file);
+    let project = Path::new(&sessions::cwd_of(&file))
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(Session { file, id, project })
+}
+
+fn session_file(app: &Arc<App>) -> Option<String> {
+    app.session
+        .as_ref()
+        .map(|s| s.file.to_string_lossy().into_owned())
 }
 
 // ---------- 付箋のプロンプト ----------

@@ -1,10 +1,10 @@
-//! osd の GUI。ブリッジ API（osd-server）からセッション一覧を取り、選んだセッションの
-//! 最後のアシスタント発言を「対象の AI コメント」として表示する。
+//! osd の GUI。ブリッジ API（osd-server）が開いている 1 セッションのアシスタント発言を並べ、
+//! 選んだものを下に表示する。プロジェクトやセッションの一覧は持たない。
 //!
 //! 使い方: osd-app [--url http://127.0.0.1:8765/?t=...] [--dir <作業フォルダ>]
 //! `--url` も `--dir` も無ければ `OSD_URL`、次にカレントの `url.txt` を読む。
 
-use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq, ProjectInfo, SessionInfo, SessionsResp};
+use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq};
 use rune::tok::{self, type_};
 use rune::{AppSpec, Cx, El, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::{Kit, Markdown, root};
@@ -17,7 +17,7 @@ fn main() {
         setup: Some(setup),
         poll: Some(poll),
         scenes: &[("sample", sample)],
-        ..AppSpec::new("osd", (1100.0, 760.0), init, view)
+        ..AppSpec::new("osd", (1000.0, 760.0), init, view)
     });
 }
 
@@ -25,18 +25,13 @@ fn main() {
 #[derive(Default)]
 struct St {
     bridge: Option<(String, String)>, // (origin, token)
-    sessions: Vec<SessionInfo>,
-    /// いま動いているエージェントのプロジェクト（サーバが hc から作る）
-    projects: Vec<ProjectInfo>,
-    /// 左で開いているプロジェクト（cwd）。そのプロジェクトのセッションだけ並べる
-    expanded: Option<String>,
-    /// いま開いているセッションのファイル
-    opened: Option<String>,
-    /// そのセッションのアシスタント発言（古い順）
+    project: String,
+    session: String,
+    /// 開いているセッションのアシスタント発言（古い順）
     comments: Vec<CommentMeta>,
     /// 選んでいる発言の index
     picked: Option<u32>,
-    project: String,
+    /// 選んだ発言の本文
     markdown: String,
     status: String,
     tx: Option<Sender<Msg>>,
@@ -46,7 +41,6 @@ struct St {
 }
 
 enum Msg {
-    Sessions(Result<SessionsResp, String>),
     Comments(Result<CommentsResp, String>),
     Opened(u32, Result<InitResp, String>),
 }
@@ -95,8 +89,8 @@ fn setup(s: &mut St, waker: Waker) {
     }
     s.busy += 1;
     s.send(|origin, token| {
-        Msg::Sessions(http(&origin, &token, "GET", "/api/sessions", None).and_then(|b| {
-            serde_json::from_str::<SessionsResp>(&b).map_err(|e| format!("応答を読めません: {e}"))
+        Msg::Comments(http(&origin, &token, "GET", "/api/comments", None).and_then(|b| {
+            serde_json::from_str::<CommentsResp>(&b).map_err(|e| format!("応答を読めません: {e}"))
         }))
     });
 }
@@ -112,24 +106,14 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
     for msg in inbox {
         s.busy = s.busy.saturating_sub(1);
         match msg {
-            Msg::Sessions(Ok(list)) => {
-                s.sessions = list.sessions;
-                s.projects = list.projects;
-                s.status = list.note;
-                if s.expanded.is_none() {
-                    s.expanded = s.projects.first().map(|p| p.cwd.clone());
-                }
-            }
-            Msg::Sessions(Err(e)) => s.status = e,
             Msg::Comments(Ok(list)) => {
                 s.project = list.project;
-                // 既定は最後の発言（直前に AI が答えたもの）
-                s.picked = list.comments.last().map(|c| c.index);
+                s.session = list.session;
+                s.status = list.note;
                 s.comments = list.comments;
-                if let Some(index) = s.picked {
-                    if let Some(file) = s.opened.clone() {
-                        open(s, file, index);
-                    }
+                // 既定は最後の発言（直前に AI が答えたもの）
+                if let Some(last) = s.comments.last().map(|c| c.index) {
+                    open(s, last);
                 }
             }
             Msg::Comments(Err(e)) => s.status = e,
@@ -137,7 +121,6 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
                 s.project = init.project;
                 s.markdown = init.markdown;
                 s.picked = Some(index);
-                s.status.clear();
             }
             Msg::Opened(_, Err(e)) => s.status = e,
         }
@@ -152,7 +135,8 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
 impl St {
     /// HTTP はスレッドで走らせ、終わったら channel で受けて waker で画面を起こす。
     fn send(&self, job: impl FnOnce(String, String) -> Msg + Send + 'static) {
-        let (Some(bridge), Some(tx), waker) = (self.bridge.clone(), self.tx.clone(), self.waker.clone())
+        let (Some(bridge), Some(tx), waker) =
+            (self.bridge.clone(), self.tx.clone(), self.waker.clone())
         else {
             return;
         };
@@ -163,36 +147,12 @@ impl St {
             }
         });
     }
-
-    /// セッションを開く: 発言の一覧を取り、最後のものを表示する。
-    fn open_session(&mut self, file: String) {
-        self.opened = Some(file.clone());
-        self.comments.clear();
-        self.picked = None;
-        self.markdown.clear();
-        self.busy += 1;
-        let body = serde_json::to_string(&OpenReq {
-            file,
-            ..OpenReq::default()
-        })
-        .unwrap_or_default();
-        self.send(move |origin, token| {
-            Msg::Comments(
-                http(&origin, &token, "POST", "/api/comments", Some(&body))
-                    .and_then(|b| serde_json::from_str::<CommentsResp>(&b).map_err(|e| e.to_string())),
-            )
-        });
-    }
 }
 
 /// 指定のアシスタント発言を本筋にして、その本文を表示する。
-fn open(s: &mut St, file: String, index: u32) {
+fn open(s: &mut St, index: u32) {
     s.busy += 1;
-    let body = serde_json::to_string(&OpenReq {
-        file,
-        index: Some(index),
-    })
-    .unwrap_or_default();
+    let body = serde_json::to_string(&OpenReq { index: Some(index) }).unwrap_or_default();
     s.send(move |origin, token| {
         Msg::Opened(
             index,
@@ -210,6 +170,11 @@ fn kit() -> Kit {
 fn view(s: &St, _: &mut Cx<St>) -> El {
     let t = tok::theme(true);
     let k = kit();
+    let title = if s.session.is_empty() {
+        format!("osd · {}", s.project)
+    } else {
+        format!("osd · {} · {}", s.project, s.session)
+    };
     let header = row()
         .w_full()
         .px(16.0)
@@ -217,127 +182,23 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
         .gap(12.0)
         .center_y()
         .fill(t.card)
-        .child(text(format!("osd · {}", s.project)).font(type_::LABEL).color(t.text))
+        .child(text(title).font(type_::LABEL).color(t.text))
         .child(
             text(if s.busy > 0 { "読み込んでいます…" } else { s.status.as_str() })
                 .font(type_::LABEL)
                 .color(t.text_secondary),
         );
 
-    let body = row()
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(1.0)
-        .fill(t.separator)
-        .child(session_list(s, t))
-        .child(comment_pane(s, &k, t));
-
-    root(col().w_full().h_full().fill(t.bg).child(header).child(body), vec![])
-}
-
-fn session_list(s: &St, t: tok::Theme) -> El {
-    let mut list = col().w_full().gap(2.0).padding(8.0);
-    if s.projects.is_empty() && s.busy == 0 {
-        list = list.child(
-            text("動いているエージェントのプロジェクトがありません")
-                .font(type_::BODY)
-                .color(t.text_secondary),
-        );
-    }
-    for project in &s.projects {
-        let cwd = project.cwd.clone();
-        let open = s.expanded.as_deref() == Some(cwd.as_str());
-        let cwd_for_toggle = cwd.clone();
-        let sessions: Vec<&SessionInfo> =
-            s.sessions.iter().filter(|x| x.cwd == project.cwd).collect();
-        list = list.child(
-            el()
-                .key(format!("p-{cwd}"))
-                .w_full()
-                .padding(8.0)
-                .radius(6.0)
-                .fill(if open { t.hover } else { t.bg })
-                .on_press(move |s: &mut St| {
-                    s.expanded = if s.expanded.as_deref() == Some(cwd_for_toggle.as_str()) {
-                        None
-                    } else {
-                        Some(cwd_for_toggle.clone())
-                    }
-                })
-                .child(
-                    row()
-                        .w_full()
-                        .gap(8.0)
-                        .child(
-                            text(project.name.clone())
-                                .font(type_::LABEL)
-                                .color(t.text)
-                                .grow(1.0),
-                        )
-                        .child(
-                            text(format!("{}体", project.agents))
-                                .font(type_::LABEL)
-                                .color(t.text_secondary),
-                        )
-                        .child(
-                            text(format!("{}件", project.sessions))
-                                .font(type_::LABEL)
-                                .color(t.text_secondary),
-                        )
-                        .child(text(when(project.updated)).font(type_::LABEL).color(t.text_secondary)),
-                ),
-        );
-        if !open {
-            continue;
-        }
-        for session in sessions {
-            let chosen = s.opened.as_deref() == Some(session.file.as_str());
-            let file = session.file.clone();
-            list = list.child(
-                el()
-                    .key(format!("s-{}", session.id))
-                    .w_full()
-                    .padding(6.0)
-                    .px(18.0)
-                    .radius(6.0)
-                    .fill(if chosen { t.hover } else { t.bg })
-                    .on_press(move |s: &mut St| s.open_session(file.clone()))
-                    .child(
-                        col()
-                            .w_full()
-                            .gap(3.0)
-                            .child(text(when(session.updated)).font(type_::LABEL).color(t.text_secondary))
-                            .child(
-                                text(session.preview.clone())
-                                    .font(type_::BODY)
-                                    .wrap()
-                                    .max_lines(2)
-                                    .color(if chosen { t.text } else { t.text_secondary }),
-                            ),
-                    ),
-            );
-        }
-    }
-    col()
-        .key("sessions")
-        .w(380.0)
-        .h_full()
-        .min_h(0.0)
-        .fill(t.bg)
-        .child(list.scroll(ScrollSpec { stick_bottom: false }))
-}
-
-fn comment_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
-    col()
-        .key("comment")
-        .grow(1.0)
-        .h_full()
-        .min_h(0.0)
-        .min_w(0.0)
-        .fill(t.bg)
-        .child(comment_list(s, t))
-        .child(comment_body(s, k, t))
+    root(
+        col()
+            .w_full()
+            .h_full()
+            .fill(t.bg)
+            .child(header)
+            .child(comment_list(s, t))
+            .child(comment_body(s, &k, t)),
+        vec![],
+    )
 }
 
 /// 上: そのセッションのアシスタント発言の一覧。
@@ -345,31 +206,32 @@ fn comment_list(s: &St, t: tok::Theme) -> El {
     let mut list = col().w_full().gap(2.0).padding(8.0);
     if s.comments.is_empty() {
         list = list.child(
-            text(if s.opened.is_some() {
-                "このセッションにはアシスタントの発言がありません"
+            text(if s.status.is_empty() {
+                "アシスタントの発言がありません"
             } else {
-                "左からセッションを選んでください"
+                s.status.as_str()
             })
             .font(type_::BODY)
             .color(t.text_secondary),
         );
     }
-    for comment in &s.comments {
+    // 新しい発言を上に（既定で選ばれる最後の発言が、そのまま先頭に来る）
+    for comment in s.comments.iter().rev() {
         let chosen = s.picked == Some(comment.index);
         let index = comment.index;
-        let file = s.opened.clone().unwrap_or_default();
         list = list.child(
             el()
                 .key(format!("c-{index}"))
                 .w_full()
-                .padding(6.0)
+                .px(10.0)
+                .py(6.0)
                 .radius(6.0)
                 .fill(if chosen { t.hover } else { t.bg })
-                .on_press(move |s: &mut St| open(s, file.clone(), index))
+                .on_press(move |s: &mut St| open(s, index))
                 .child(
                     row()
                         .w_full()
-                        .gap(8.0)
+                        .gap(10.0)
                         .child(
                             text(format!("{index:02}"))
                                 .font(type_::LABEL)
@@ -387,11 +249,11 @@ fn comment_list(s: &St, t: tok::Theme) -> El {
                 ),
         );
     }
-    // 発言が多いセッションでも本文を圧迫しないよう、上は 220pt まで
+    // 発言が多くても本文を圧迫しないよう、上は 260pt まで
     col()
         .key("comments")
         .w_full()
-        .max_h(220.0)
+        .max_h(260.0)
         .min_h(0.0)
         .shrink()
         .fill(t.bg)
@@ -419,24 +281,6 @@ fn comment_body(s: &St, k: &Kit, t: tok::Theme) -> El {
         .min_h(0.0)
         .fill(t.bg)
         .child(body.scroll(ScrollSpec { stick_bottom: false }))
-}
-
-/// 更新時刻を「いま / N分前 / N時間前 / N日前」に。
-fn when(ms: u64) -> String {
-    if ms == 0 {
-        return "—".to_string();
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let ago = now.saturating_sub(ms) / 1000;
-    match ago {
-        0..=59 => "いま".to_string(),
-        60..=3599 => format!("{}分前", ago / 60),
-        3600..=86399 => format!("{}時間前", ago / 3600),
-        _ => format!("{}日前", ago / 86400),
-    }
 }
 
 // ---------- ブリッジの呼び出し ----------
@@ -474,55 +318,8 @@ fn http(origin: &str, token: &str, method: &str, path: &str, body: Option<&str>)
 
 // ---------- 見た目を確かめるための見本 ----------
 fn sample(s: &mut St) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
     s.project = "osd".into();
-    s.sessions = vec![
-        SessionInfo {
-            id: "01a1fd24".into(),
-            file: "/tmp/a.jsonl".into(),
-            cwd: "/Users/335g/Dev/osd".into(),
-            project: "osd".into(),
-            updated: now,
-            preview: "APIサーバーはaxumですかね".into(),
-        },
-        SessionInfo {
-            id: "01a1fcdd".into(),
-            file: "/tmp/b.jsonl".into(),
-            cwd: "/Users/335g/Dev/osd".into(),
-            project: "osd".into(),
-            updated: now - 1_800_000,
-            preview: "このテストが落ちる理由を調べて".into(),
-        },
-        SessionInfo {
-            id: "01a1fcee".into(),
-            file: "/tmp/c.jsonl".into(),
-            cwd: "/Users/335g/Dev/ghq/github.com/335g/tuit".into(),
-            project: "tuit".into(),
-            updated: now - 7_200_000,
-            preview: "git commit の履歴をリアルタイムで見たい".into(),
-        },
-    ];
-    s.projects = vec![
-        ProjectInfo {
-            cwd: "/Users/335g/Dev/osd".into(),
-            name: "osd".into(),
-            agents: 1,
-            sessions: 2,
-            updated: now,
-        },
-        ProjectInfo {
-            cwd: "/Users/335g/Dev/ghq/github.com/335g/tuit".into(),
-            name: "tuit".into(),
-            agents: 3,
-            sessions: 1,
-            updated: now - 3_600_000,
-        },
-    ];
-    s.expanded = Some("/Users/335g/Dev/osd".into());
-    s.opened = Some("/tmp/a.jsonl".into());
+    s.session = "01a1fd24-52d6-7790-bbc5-480de8a81dde".into();
     s.comments = vec![
         CommentMeta { index: 0, preview: "まず恒等写像の定義を確認します。".into(), chars: 40 },
         CommentMeta { index: 1, preview: "`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。".into(), chars: 320 },
@@ -535,10 +332,10 @@ fn sample(s: &mut St) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead;
 
     #[test]
     fn http_talks_to_a_local_server() {
+        use std::io::BufRead;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -577,22 +374,11 @@ mod tests {
             "abc",
             "POST",
             "/api/open",
-            Some(r#"{"file":"/tmp/a.jsonl"}"#),
+            Some(r#"{"index":0}"#),
         )
         .unwrap();
         assert_eq!(got, r#"{"ok":true}"#);
         server.join().unwrap();
     }
 
-    #[test]
-    fn when_says_relative_time() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        assert_eq!(when(now), "いま");
-        assert_eq!(when(now - 120_000), "2分前");
-        assert_eq!(when(now - 7_200_000), "2時間前");
-        assert_eq!(when(0), "—");
-    }
 }
