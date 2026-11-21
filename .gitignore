@@ -1,12 +1,17 @@
-# 基本は全て管理しない
+# 既定は全て管理しない
 *
 
-# 明らかに管理すべきでないものは明示的にも拒否しておく
+# 明らかに管理すべきでないもの
 node_modules
 target
 .env
-
+.envrc
 CONTEXT.md
 
 # 管理するもの
 !.gitignore
+!Cargo.toml
+!Cargo.lock
+!README.md
+!crates/
+!crates/**
