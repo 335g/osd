@@ -11,7 +11,7 @@ AI の長い回答を、付箋と図で噛み砕いて理解するためのネ�
 |---|---|
 | `crates/osd-api` | ブリッジ API の型（サーバと GUI で共有） |
 | `crates/osd-server` | ブリッジ API サーバ。`pi` をフォークして付箋の質問に答える |
-| `crates/osd-app` | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)）。まだ骨組み |
+| `crates/osd-app` | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)）。本筋・付箋・返す文まで動く |
 
 ## osd-server
 
@@ -58,9 +58,17 @@ cargo test -p osd-server
 ## osd-app
 
 ```sh
-cargo run -p osd-app            # ウィンドウ
-cargo run -p osd-app -- --snap /tmp/osd.png   # ヘッドレスで PNG 確認
+cargo run -p osd-app -- --dir <作業フォルダ>        # ウィンドウ
+cargo run -p osd-app -- --url 'http://127.0.0.1:8765/?t=...'
+cargo run -p osd-app -- --scene note --snap /tmp/osd.png   # ヘッドレスで見た目確認
 ```
+
+左に本筋（markdown、mermaid はネイティブ描画）、右に付箋。本筋の段落を押すと
+「詳しく / 用語 / 図 / レビュー / 質問」が出て、答えた内容が付箋として並ぶ。
+最後に「本筋に返す文」を書いて「返して閉じる」でブリッジが `return.md` を書いて終了する。
+
+ブリッジの URL は `--url`、`--dir`、`OSD_URL`、カレントの `url.txt` の順に探す。
+`--scene note` / `--scene ask` はブリッジ無し／偽ブリッジで見た目を確かめる見本。
 
 rune は pre-release なので rev を固定する。`Cargo.toml` の `[patch.crates-io]` は rune の
 README「Depending on Rune」の指示どおり、rune と同じ rev で揃えている（更新時は両方まとめて）。

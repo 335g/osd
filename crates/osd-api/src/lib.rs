@@ -20,8 +20,8 @@ impl Default for Action {
 }
 
 /// GET /api/init
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct InitResp {
     /// 本筋（直前のアシスタント回答）の markdown
     pub markdown: String,
@@ -48,8 +48,8 @@ pub struct AskReq {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct AskResp {
     pub ok: bool,
     pub text: String,
@@ -88,8 +88,8 @@ pub struct ReturnReq {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct OkResp {
     pub ok: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
