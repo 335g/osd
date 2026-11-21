@@ -6,7 +6,7 @@
 
 use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq};
 use rune::tok::{self, type_};
-use rune::{AppSpec, Cx, El, ScrollSpec, Tx, Waker, col, el, row, text};
+use rune::{AppSpec, Cx, El, Key, KeyEvent, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::{Kit, Markdown, root};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -16,6 +16,7 @@ fn main() {
     rune::run(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
+        on_key: Some(on_key),
         scenes: &[("sample", sample)],
         ..AppSpec::new("osd", (1000.0, 760.0), init, view)
     });
@@ -33,6 +34,8 @@ struct St {
     picked: Option<u32>,
     /// 選んだ発言の本文
     markdown: String,
+    /// 左の発言一覧を開いているか（⌘B で切り替え）
+    list_open: bool,
     status: String,
     tx: Option<Sender<Msg>>,
     rx: Option<Receiver<Msg>>,
@@ -79,6 +82,22 @@ fn bridge_url() -> Option<(String, String)> {
     })?;
     let (origin, token) = url.split_once("/?t=")?;
     Some((origin.to_owned(), token.to_owned()))
+}
+
+/// ⌘B（macOS 以外は Ctrl+B）で左の発言一覧を開け閉めする。
+fn on_key(s: &mut St, event: &KeyEvent, _: &mut Tx) -> bool {
+    if !is_list_toggle(event) {
+        return false;
+    }
+    s.list_open = !s.list_open;
+    true
+}
+
+/// macOS は ⌘B が `Key::Command`、それ以外の環境では修飾キー付きの `Key::Text` で届く。
+fn is_list_toggle(event: &KeyEvent) -> bool {
+    event.is_command('b')
+        || ((event.mods.cmd || event.mods.ctrl)
+            && matches!(&event.key, Key::Text(t) if t.eq_ignore_ascii_case("b")))
 }
 
 fn setup(s: &mut St, waker: Waker) {
@@ -183,11 +202,31 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
         .center_y()
         .fill(t.card)
         .child(text(title).font(type_::LABEL).color(t.text))
+        .child(text("").grow(1.0))
+        .child(
+            el()
+                .key("toggle")
+                .px(8.0)
+                .py(3.0)
+                .radius(5.0)
+                .on_press(|s: &mut St| s.list_open = !s.list_open)
+                .child(
+                    text(if s.list_open { "≡ 一覧を閉じる" } else { "≡ 一覧 ⌘B" })
+                        .font(type_::LABEL)
+                        .color(if s.list_open { t.text } else { t.text_secondary }),
+                ),
+        )
         .child(
             text(if s.busy > 0 { "読み込んでいます…" } else { s.status.as_str() })
                 .font(type_::LABEL)
                 .color(t.text_secondary),
         );
+
+    let mut body = row().w_full().grow(1.0).min_h(0.0).fill(t.bg);
+    if s.list_open {
+        body = body.child(comment_list(s, t)).child(el().w(1.0).h_full().fill(t.separator));
+    }
+    body = body.child(comment_body(s, &k, t));
 
     root(
         col()
@@ -195,19 +234,18 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
             .h_full()
             .fill(t.bg)
             .child(header)
-            .child(comment_list(s, t))
-            .child(comment_body(s, &k, t)),
+            .child(body),
         vec![],
     )
 }
 
 /// 上: そのセッションのアシスタント発言の一覧。
 fn comment_list(s: &St, t: tok::Theme) -> El {
-    let mut list = col().w_full().gap(2.0).padding(8.0);
+    let mut list = col().w_full().gap(1.0).padding(8.0);
     if s.comments.is_empty() {
         list = list.child(
             text(if s.status.is_empty() {
-                "アシスタントの発言がありません"
+                "発言がありません"
             } else {
                 s.status.as_str()
             })
@@ -235,6 +273,7 @@ fn comment_list(s: &St, t: tok::Theme) -> El {
                         .child(
                             text(format!("{index:02}"))
                                 .font(type_::LABEL)
+                                .w(18.0)
                                 .color(if chosen { tok::accent(0, true) } else { t.text_secondary }),
                         )
                         .child(
@@ -243,19 +282,17 @@ fn comment_list(s: &St, t: tok::Theme) -> El {
                                 .wrap()
                                 .grow(1.0)
                                 .min_w(0.0)
-                                .max_lines(2)
+                                .max_lines(3)
                                 .color(if chosen { t.text } else { t.text_secondary }),
                         ),
                 ),
         );
     }
-    // 発言が多くても本文を圧迫しないよう、上は 260pt まで
     col()
         .key("comments")
-        .w_full()
-        .max_h(260.0)
+        .w(300.0)
+        .h_full()
         .min_h(0.0)
-        .shrink()
         .fill(t.bg)
         .child(list.scroll(ScrollSpec { stick_bottom: false }))
 }
@@ -264,7 +301,7 @@ fn comment_list(s: &St, t: tok::Theme) -> El {
 fn comment_body(s: &St, k: &Kit, t: tok::Theme) -> El {
     let body = if s.markdown.is_empty() {
         col().padding(16.0).child(
-            text("上から発言を選ぶと、ここに出ます")
+            text("⌘B で一覧を開いて、発言を選んでください")
                 .font(type_::BODY)
                 .color(t.text_secondary),
         )
@@ -276,9 +313,10 @@ fn comment_body(s: &St, k: &Kit, t: tok::Theme) -> El {
     };
     col()
         .key("body")
-        .w_full()
         .grow(1.0)
+        .h_full()
         .min_h(0.0)
+        .min_w(0.0)
         .fill(t.bg)
         .child(body.scroll(ScrollSpec { stick_bottom: false }))
 }
@@ -326,12 +364,26 @@ fn sample(s: &mut St) {
         CommentMeta { index: 2, preview: "図にすると一直線です。".into(), chars: 90 },
     ];
     s.picked = Some(1);
+    s.list_open = true;
     s.markdown = "## 恒等写像とは\n\n`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。\n\n```mermaid\nflowchart LR\n  A[\"入力 x\"] --> B[\"id\"] --> C[\"出力 x\"]\n```\n\n| 用途 | 例 |\n|---|---|\n| 既定値 | `unwrap_or_else` |\n".into();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_b_is_the_list_toggle() {
+        use rune::Mods;
+        let ev = |key, mods| KeyEvent { key, mods };
+        // macOS: ⌘B は Key::Command で届く
+        assert!(is_list_toggle(&ev(Key::Command('b'), Mods { cmd: true, ..Mods::default() })));
+        // それ以外の環境: 修飾キー付きの Key::Text
+        assert!(is_list_toggle(&ev(Key::Text("b".into()), Mods { ctrl: true, ..Mods::default() })));
+        // 修飾キー無しの b は素通し
+        assert!(!is_list_toggle(&ev(Key::Text("b".into()), Mods::default())));
+        assert!(!is_list_toggle(&ev(Key::Command('x'), Mods { cmd: true, ..Mods::default() })));
+    }
 
     #[test]
     fn http_talks_to_a_local_server() {
