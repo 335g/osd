@@ -120,9 +120,30 @@ pub struct SessionsResp {
     pub sessions: Vec<SessionInfo>,
 }
 
-/// POST /api/open — 選んだセッションの最後のアシスタント発言を本筋にする
+/// POST /api/open — 選んだアシスタント発言を本筋にする（index 省略なら最後）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OpenReq {
     pub file: String,
+    /// セッション内の何番目のアシスタント発言か（0 始まり）
+    pub index: Option<u32>,
+}
+
+/// セッション内の 1 つのアシスタント発言（一覧に出す分だけ）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommentMeta {
+    pub index: u32,
+    /// 一覧で見分けるための先頭部分（1 行）
+    pub preview: String,
+    /// 元の文字数
+    pub chars: u32,
+}
+
+/// POST /api/comments
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommentsResp {
+    pub project: String,
+    pub comments: Vec<CommentMeta>,
 }

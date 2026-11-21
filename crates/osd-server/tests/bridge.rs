@@ -174,12 +174,18 @@ fn init_ask_return() {
     assert!(body.contains("最初の頼みごと"), "一覧に見分けが付く文: {body}");
     assert!(body.contains("\"project\":\"project\""), "cwd から project: {body}");
 
-    // 選んだセッションの最後のアシスタント発言を本筋にする
+    // セッション内のアシスタント発言の一覧
     let file = s
         .work
         .join("pi-sessions/--tmp-project--")
         .join(format!("2026-01-01T00-00-00-000Z_{SESSION_ID}.jsonl"));
     let body_req = format!(r#"{{"file":"{}"}}"#, file.display());
+    let (code, body) = s.call("POST", "/api/comments", &s.token, &body_req);
+    assert_eq!(code, 200);
+    assert!(body.contains("\"index\":1"), "2 件目まで数える: {body}");
+    assert!(body.contains("古い答え"), "一覧に見分けが付く文: {body}");
+
+    // 選んだセッションの最後のアシスタント発言を本筋にする
     let (code, body) = s.call("POST", "/api/open", &s.token, &body_req);
     assert_eq!(code, 200);
     assert!(body.contains("最後の答え"), "最後の発言を返す: {body}");
@@ -187,6 +193,12 @@ fn init_ask_return() {
         std::fs::read_to_string(s.work.join("main.md")).unwrap().trim(),
         "最後の答え"
     );
+
+    // index 指定で途中の発言を選べる
+    let body_req = format!(r#"{{"file":"{}","index":0}}"#, file.display());
+    let (code, body) = s.call("POST", "/api/open", &s.token, &body_req);
+    assert_eq!(code, 200);
+    assert!(body.contains("古い答え"), "index で選んだ発言: {body}");
 
     // 置き場の外は読ませない
     let (_, body) = s.call(

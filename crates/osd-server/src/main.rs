@@ -17,7 +17,8 @@ use axum::{
     Json, Router,
 };
 use osd_api::{
-    Action, AskReq, AskResp, DraftReq, InitResp, OkResp, OpenReq, ReturnReq, SessionsResp,
+    Action, AskReq, AskResp, CommentMeta, CommentsResp, DraftReq, InitResp, OkResp, OpenReq,
+    ReturnReq, SessionsResp,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -133,6 +134,7 @@ fn routes(app: Arc<App>) -> Router {
         .route("/api/init", get(init))
         .route("/api/sessions", get(list_sessions))
         .route("/api/open", post(open))
+        .route("/api/comments", post(comments))
         .route("/api/ask", post(ask))
         .route("/api/draft", post(draft))
         .route("/api/return", post(close))
@@ -199,7 +201,31 @@ async fn list_sessions() -> Json<SessionsResp> {
     Json(SessionsResp { sessions: found })
 }
 
-/// 選んだセッションの最後のアシスタント発言を本筋にして、以後の分岐元にする。
+/// セッション内のアシスタント発言の一覧（一覧に出す分だけ）。
+async fn comments(Json(body): Json<OpenReq>) -> Json<CommentsResp> {
+    let base = sessions::dir();
+    let Some(file) = sessions::resolve(&base, &body.file) else {
+        return Json(CommentsResp::default());
+    };
+    let project = project_of(&file);
+    let messages = tokio::task::spawn_blocking(move || sessions::assistant_messages(&file))
+        .await
+        .unwrap_or_default();
+    Json(CommentsResp {
+        project,
+        comments: messages
+            .iter()
+            .enumerate()
+            .map(|(i, text)| CommentMeta {
+                index: i as u32,
+                preview: sessions::one_line(text, 120),
+                chars: text.chars().count() as u32,
+            })
+            .collect(),
+    })
+}
+
+/// 選んだアシスタント発言を本筋にして、以後の分岐元にする。
 async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenReq>) -> Json<InitResp> {
     let base = sessions::dir();
     let Some(file) = sessions::resolve(&base, &body.file) else {
@@ -210,7 +236,11 @@ async fn open(State(app): State<Arc<App>>, Json(body): Json<OpenReq>) -> Json<In
     };
     let text = tokio::task::spawn_blocking({
         let file = file.clone();
-        move || sessions::last_assistant(&file)
+        let index = body.index;
+        move || match index {
+            Some(i) => sessions::assistant_messages(&file).get(i as usize).cloned(),
+            None => sessions::last_assistant(&file),
+        }
     })
     .await
     .ok()

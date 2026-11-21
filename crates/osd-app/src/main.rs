@@ -4,7 +4,7 @@
 //! 使い方: osd-app [--url http://127.0.0.1:8765/?t=...] [--dir <作業フォルダ>]
 //! `--url` も `--dir` も無ければ `OSD_URL`、次にカレントの `url.txt` を読む。
 
-use osd_api::{InitResp, OpenReq, SessionInfo, SessionsResp};
+use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq, SessionInfo, SessionsResp};
 use rune::tok::{self, type_};
 use rune::{AppSpec, Cx, El, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::{Kit, Markdown, root};
@@ -26,8 +26,12 @@ fn main() {
 struct St {
     bridge: Option<(String, String)>, // (origin, token)
     sessions: Vec<SessionInfo>,
-    /// いま表示しているセッションのファイル
+    /// いま開いているセッションのファイル
     opened: Option<String>,
+    /// そのセッションのアシスタント発言（古い順）
+    comments: Vec<CommentMeta>,
+    /// 選んでいる発言の index
+    picked: Option<u32>,
     project: String,
     markdown: String,
     status: String,
@@ -39,7 +43,8 @@ struct St {
 
 enum Msg {
     Sessions(Result<SessionsResp, String>),
-    Opened(Result<InitResp, String>),
+    Comments(Result<CommentsResp, String>),
+    Opened(u32, Result<InitResp, String>),
 }
 
 fn init() -> St {
@@ -93,10 +98,14 @@ fn setup(s: &mut St, waker: Waker) {
 }
 
 fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
-    let mut changed = false;
-    let Some(rx) = &s.rx else { return false };
-    while let Ok(msg) = rx.try_recv() {
-        changed = true;
+    let mut inbox = Vec::new();
+    if let Some(rx) = &s.rx {
+        while let Ok(msg) = rx.try_recv() {
+            inbox.push(msg);
+        }
+    }
+    let mut changed = !inbox.is_empty();
+    for msg in inbox {
         s.busy = s.busy.saturating_sub(1);
         match msg {
             Msg::Sessions(Ok(list)) => {
@@ -104,12 +113,25 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
                 s.status.clear();
             }
             Msg::Sessions(Err(e)) => s.status = e,
-            Msg::Opened(Ok(init)) => {
+            Msg::Comments(Ok(list)) => {
+                s.project = list.project;
+                // 既定は最後の発言（直前に AI が答えたもの）
+                s.picked = list.comments.last().map(|c| c.index);
+                s.comments = list.comments;
+                if let Some(index) = s.picked {
+                    if let Some(file) = s.opened.clone() {
+                        open(s, file, index);
+                    }
+                }
+            }
+            Msg::Comments(Err(e)) => s.status = e,
+            Msg::Opened(index, Ok(init)) => {
                 s.project = init.project;
                 s.markdown = init.markdown;
+                s.picked = Some(index);
                 s.status.clear();
             }
-            Msg::Opened(Err(e)) => s.status = e,
+            Msg::Opened(_, Err(e)) => s.status = e,
         }
     }
     if s.busy > 0 {
@@ -134,17 +156,42 @@ impl St {
         });
     }
 
-    fn open(&mut self, file: String) {
+    /// セッションを開く: 発言の一覧を取り、最後のものを表示する。
+    fn open_session(&mut self, file: String) {
         self.opened = Some(file.clone());
+        self.comments.clear();
+        self.picked = None;
+        self.markdown.clear();
         self.busy += 1;
-        let body = serde_json::to_string(&OpenReq { file }).unwrap_or_default();
+        let body = serde_json::to_string(&OpenReq {
+            file,
+            ..OpenReq::default()
+        })
+        .unwrap_or_default();
         self.send(move |origin, token| {
-            Msg::Opened(
-                http(&origin, &token, "POST", "/api/open", Some(&body))
-                    .and_then(|b| serde_json::from_str::<InitResp>(&b).map_err(|e| e.to_string())),
+            Msg::Comments(
+                http(&origin, &token, "POST", "/api/comments", Some(&body))
+                    .and_then(|b| serde_json::from_str::<CommentsResp>(&b).map_err(|e| e.to_string())),
             )
         });
     }
+}
+
+/// 指定のアシスタント発言を本筋にして、その本文を表示する。
+fn open(s: &mut St, file: String, index: u32) {
+    s.busy += 1;
+    let body = serde_json::to_string(&OpenReq {
+        file,
+        index: Some(index),
+    })
+    .unwrap_or_default();
+    s.send(move |origin, token| {
+        Msg::Opened(
+            index,
+            http(&origin, &token, "POST", "/api/open", Some(&body))
+                .and_then(|b| serde_json::from_str::<InitResp>(&b).map_err(|e| e.to_string())),
+        )
+    });
 }
 
 // ---------- 見た目 ----------
@@ -196,7 +243,7 @@ fn session_list(s: &St, t: tok::Theme) -> El {
                 .padding(8.0)
                 .radius(6.0)
                 .fill(if chosen { t.hover } else { t.bg })
-                .on_press(move |s: &mut St| s.open(file.clone()))
+                .on_press(move |s: &mut St| s.open_session(file.clone()))
                 .child(
                     col()
                         .w_full()
@@ -211,6 +258,8 @@ fn session_list(s: &St, t: tok::Theme) -> El {
                         .child(
                             text(session.preview.clone())
                                 .font(type_::BODY)
+                                .wrap()
+                                .max_lines(2)
                                 .color(t.text_secondary),
                         ),
                 ),
@@ -226,9 +275,80 @@ fn session_list(s: &St, t: tok::Theme) -> El {
 }
 
 fn comment_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
+    col()
+        .key("comment")
+        .grow(1.0)
+        .h_full()
+        .min_h(0.0)
+        .min_w(0.0)
+        .fill(t.bg)
+        .child(comment_list(s, t))
+        .child(comment_body(s, k, t))
+}
+
+/// 上: そのセッションのアシスタント発言の一覧。
+fn comment_list(s: &St, t: tok::Theme) -> El {
+    let mut list = col().w_full().gap(2.0).padding(8.0);
+    if s.comments.is_empty() {
+        list = list.child(
+            text(if s.opened.is_some() {
+                "このセッションにはアシスタントの発言がありません"
+            } else {
+                "左からセッションを選んでください"
+            })
+            .font(type_::BODY)
+            .color(t.text_secondary),
+        );
+    }
+    for comment in &s.comments {
+        let chosen = s.picked == Some(comment.index);
+        let index = comment.index;
+        let file = s.opened.clone().unwrap_or_default();
+        list = list.child(
+            el()
+                .key(format!("c-{index}"))
+                .w_full()
+                .padding(6.0)
+                .radius(6.0)
+                .fill(if chosen { t.hover } else { t.bg })
+                .on_press(move |s: &mut St| open(s, file.clone(), index))
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .child(
+                            text(format!("{index:02}"))
+                                .font(type_::LABEL)
+                                .color(if chosen { tok::accent(0, true) } else { t.text_secondary }),
+                        )
+                        .child(
+                            text(comment.preview.clone())
+                                .font(type_::BODY)
+                                .wrap()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .max_lines(2)
+                                .color(if chosen { t.text } else { t.text_secondary }),
+                        ),
+                ),
+        );
+    }
+    // 発言が多いセッションでも本文を圧迫しないよう、上は 220pt まで
+    col()
+        .key("comments")
+        .w_full()
+        .max_h(220.0)
+        .min_h(0.0)
+        .shrink()
+        .fill(t.bg)
+        .child(list.scroll(ScrollSpec { stick_bottom: false }))
+}
+
+/// 下: 選んだ発言の本文。
+fn comment_body(s: &St, k: &Kit, t: tok::Theme) -> El {
     let body = if s.markdown.is_empty() {
         col().padding(16.0).child(
-            text("左からセッションを選ぶと、最後のアシスタント発言が出ます")
+            text("上から発言を選ぶと、ここに出ます")
                 .font(type_::BODY)
                 .color(t.text_secondary),
         )
@@ -239,11 +359,10 @@ fn comment_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
             .child(Markdown::new(s.markdown.clone()).selectable(true).build(k))
     };
     col()
-        .key("comment")
+        .key("body")
+        .w_full()
         .grow(1.0)
-        .h_full()
         .min_h(0.0)
-        .min_w(0.0)
         .fill(t.bg)
         .child(body.scroll(ScrollSpec { stick_bottom: false }))
 }
@@ -322,6 +441,12 @@ fn sample(s: &mut St) {
         },
     ];
     s.opened = Some("/tmp/a.jsonl".into());
+    s.comments = vec![
+        CommentMeta { index: 0, preview: "まず恒等写像の定義を確認します。".into(), chars: 40 },
+        CommentMeta { index: 1, preview: "`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。".into(), chars: 320 },
+        CommentMeta { index: 2, preview: "図にすると一直線です。".into(), chars: 90 },
+    ];
+    s.picked = Some(1);
     s.markdown = "## 恒等写像とは\n\n`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。\n\n```mermaid\nflowchart LR\n  A[\"入力 x\"] --> B[\"id\"] --> C[\"出力 x\"]\n```\n\n| 用途 | 例 |\n|---|---|\n| 既定値 | `unwrap_or_else` |\n".into();
 }
 

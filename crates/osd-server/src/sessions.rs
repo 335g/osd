@@ -54,6 +54,31 @@ pub fn list(base: &Path) -> Vec<SessionInfo> {
     out
 }
 
+/// セッション内のアシスタント発言（テキストのあるものだけ、古い順）。
+pub fn assistant_messages(file: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // 巨大なシステムプロンプトの行は飛ばす
+        if line.contains("\"role\":\"system\"") {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if ev["type"] != "message" || ev["message"]["role"] != "assistant" {
+            continue;
+        }
+        let body = assistant_text(&ev["message"]);
+        if !body.is_empty() {
+            out.push(body);
+        }
+    }
+    out
+}
+
 /// 選んだセッションの最後のアシスタント発言。無ければ None。
 pub fn last_assistant(file: &Path) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
@@ -138,7 +163,8 @@ fn assistant_text(message: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn one_line(text: &str, max: usize) -> String {
+/// 改行と連続空白を 1 つに潰して max 文字に切る。
+pub fn one_line(text: &str, max: usize) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     joined.chars().take(max).collect()
 }

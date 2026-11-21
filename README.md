@@ -36,7 +36,8 @@ osd: http://127.0.0.1:8765/?t=<合言葉>
 |---|---|---|
 | `GET /api/init` | — | `{markdown, title, hasSession, project}` |
 | `GET /api/sessions` | — | `{sessions: [{id, file, cwd, project, updated, preview}]}`（新しい順） |
-| `POST /api/open` | `{file}` | `{markdown, ...}`。そのセッションの最後のアシスタント発言を本筋にする |
+| `POST /api/comments` | `{file}` | `{project, comments: [{index, preview, chars}]}`（そのセッションのアシスタント発言） |
+| `POST /api/open` | `{file, index?}` | `{markdown, ...}`。選んだアシスタント発言を本筋にする（index 省略＝最後） |
 | `POST /api/ask` | `{action, anchor, question}` / `{continueSession, forkFile, followUp}` | `{ok, text, sessionId, forkFile, costUsd}` |
 | `POST /api/draft` | `{notes}` | 同上（本筋に返す文の下書き） |
 | `POST /api/return` | `{text}` | `{ok}` |
@@ -65,8 +66,9 @@ cargo run -p osd-app -- --url 'http://127.0.0.1:8765/?t=...'
 cargo run -p osd-app -- --scene note --snap /tmp/osd.png   # ヘッドレスで見た目確認
 ```
 
-左に全セッションの一覧（プロジェクト名・更新時刻・最初の頼みごと）、右に選んだ
-セッションの最後のアシスタント発言。現状はここまで（付箋は次の段階）。
+左に全セッションの一覧（プロジェクト名・更新時刻・最初の頼みごと）。セッションを選ぶと、
+右上にそのセッションのアシスタント発言の一覧、右下に選んだ発言の本文が出る。
+一覧は全プロジェクト横断（プロジェクトで絞る仕組みはまだ無い）。
 
 ブリッジの URL は `--url`、`--dir`、`OSD_URL`、カレントの `url.txt` の順に探す。
 `--scene sample` はブリッジ無しで見た目を確かめる見本。
