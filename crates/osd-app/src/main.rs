@@ -4,7 +4,7 @@
 //! 使い方: osd-app [--url http://127.0.0.1:8765/?t=...] [--dir <作業フォルダ>]
 //! `--url` も `--dir` も無ければ `OSD_URL`、次にカレントの `url.txt` を読む。
 
-use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq, SessionInfo, SessionsResp};
+use osd_api::{CommentMeta, CommentsResp, InitResp, OpenReq, ProjectInfo, SessionInfo, SessionsResp};
 use rune::tok::{self, type_};
 use rune::{AppSpec, Cx, El, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::{Kit, Markdown, root};
@@ -26,6 +26,8 @@ fn main() {
 struct St {
     bridge: Option<(String, String)>, // (origin, token)
     sessions: Vec<SessionInfo>,
+    /// いま動いているエージェントのプロジェクト（サーバが hc から作る）
+    projects: Vec<ProjectInfo>,
     /// 左で開いているプロジェクト（cwd）。そのプロジェクトのセッションだけ並べる
     expanded: Option<String>,
     /// いま開いているセッションのファイル
@@ -112,10 +114,11 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
         match msg {
             Msg::Sessions(Ok(list)) => {
                 s.sessions = list.sessions;
+                s.projects = list.projects;
+                s.status = list.note;
                 if s.expanded.is_none() {
-                    s.expanded = s.sessions.first().map(|x| x.cwd.clone());
+                    s.expanded = s.projects.first().map(|p| p.cwd.clone());
                 }
-                s.status.clear();
             }
             Msg::Sessions(Err(e)) => s.status = e,
             Msg::Comments(Ok(list)) => {
@@ -233,29 +236,21 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
     root(col().w_full().h_full().fill(t.bg).child(header).child(body), vec![])
 }
 
-/// セッションをプロジェクト（cwd）ごとにまとめ、新しい順に並べる。
-fn projects(s: &St) -> Vec<(String, String, Vec<&SessionInfo>)> {
-    let mut out: Vec<(String, String, Vec<&SessionInfo>)> = Vec::new();
-    for session in &s.sessions {
-        match out.iter_mut().find(|(cwd, _, _)| cwd == &session.cwd) {
-            Some((_, _, list)) => list.push(session),
-            None => out.push((session.cwd.clone(), session.project.clone(), vec![session])),
-        }
-    }
-    // どのプロジェクトも先頭が一番新しいセッションなので、その時刻で並べる
-    out.sort_by(|a, b| b.2.first().map(|s| s.updated).cmp(&a.2.first().map(|s| s.updated)));
-    out
-}
-
 fn session_list(s: &St, t: tok::Theme) -> El {
     let mut list = col().w_full().gap(2.0).padding(8.0);
-    if s.sessions.is_empty() && s.busy == 0 {
-        list = list.child(text("セッションがありません").font(type_::BODY).color(t.text_secondary));
+    if s.projects.is_empty() && s.busy == 0 {
+        list = list.child(
+            text("動いているエージェントのプロジェクトがありません")
+                .font(type_::BODY)
+                .color(t.text_secondary),
+        );
     }
-    for (cwd, project, sessions) in projects(s) {
+    for project in &s.projects {
+        let cwd = project.cwd.clone();
         let open = s.expanded.as_deref() == Some(cwd.as_str());
         let cwd_for_toggle = cwd.clone();
-        let newest = sessions.first().map(|s| s.updated).unwrap_or(0);
+        let sessions: Vec<&SessionInfo> =
+            s.sessions.iter().filter(|x| x.cwd == project.cwd).collect();
         list = list.child(
             el()
                 .key(format!("p-{cwd}"))
@@ -274,14 +269,23 @@ fn session_list(s: &St, t: tok::Theme) -> El {
                     row()
                         .w_full()
                         .gap(8.0)
-                        .child(text(project).font(type_::LABEL).color(t.text))
                         .child(
-                            text(format!("{}", sessions.len()))
+                            text(project.name.clone())
+                                .font(type_::LABEL)
+                                .color(t.text)
+                                .grow(1.0),
+                        )
+                        .child(
+                            text(format!("{}体", project.agents))
                                 .font(type_::LABEL)
                                 .color(t.text_secondary),
                         )
-                        .child(text("").grow(1.0))
-                        .child(text(when(newest)).font(type_::LABEL).color(t.text_secondary)),
+                        .child(
+                            text(format!("{}件", project.sessions))
+                                .font(type_::LABEL)
+                                .color(t.text_secondary),
+                        )
+                        .child(text(when(project.updated)).font(type_::LABEL).color(t.text_secondary)),
                 ),
         );
         if !open {
@@ -419,6 +423,9 @@ fn comment_body(s: &St, k: &Kit, t: tok::Theme) -> El {
 
 /// 更新時刻を「いま / N分前 / N時間前 / N日前」に。
 fn when(ms: u64) -> String {
+    if ms == 0 {
+        return "—".to_string();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -484,10 +491,34 @@ fn sample(s: &mut St) {
         SessionInfo {
             id: "01a1fcdd".into(),
             file: "/tmp/b.jsonl".into(),
+            cwd: "/Users/335g/Dev/osd".into(),
+            project: "osd".into(),
+            updated: now - 1_800_000,
+            preview: "このテストが落ちる理由を調べて".into(),
+        },
+        SessionInfo {
+            id: "01a1fcee".into(),
+            file: "/tmp/c.jsonl".into(),
             cwd: "/Users/335g/Dev/ghq/github.com/335g/tuit".into(),
             project: "tuit".into(),
+            updated: now - 7_200_000,
+            preview: "git commit の履歴をリアルタイムで見たい".into(),
+        },
+    ];
+    s.projects = vec![
+        ProjectInfo {
+            cwd: "/Users/335g/Dev/osd".into(),
+            name: "osd".into(),
+            agents: 1,
+            sessions: 2,
+            updated: now,
+        },
+        ProjectInfo {
+            cwd: "/Users/335g/Dev/ghq/github.com/335g/tuit".into(),
+            name: "tuit".into(),
+            agents: 3,
+            sessions: 1,
             updated: now - 3_600_000,
-            preview: "このテストが落ちる理由を調べて".into(),
         },
     ];
     s.expanded = Some("/Users/335g/Dev/osd".into());
@@ -562,5 +593,6 @@ mod tests {
         assert_eq!(when(now), "いま");
         assert_eq!(when(now - 120_000), "2分前");
         assert_eq!(when(now - 7_200_000), "2時間前");
+        assert_eq!(when(0), "—");
     }
 }

@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SESSION_ID: &str = "01a1fd25-d307-71ed-9276-f15514c05806";
+const OTHER_ID: &str = "01a1fd25-d307-71ed-9276-f15514c05807";
 
 struct Server {
     child: Child,
@@ -73,6 +74,30 @@ echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":
         .unwrap();
         make_executable(&script);
 
+        // 偽の hc: /tmp/project で 1 体だけ動いていることにする
+        let fake_hc = work.join("fake-hc.sh");
+        std::fs::write(
+            &fake_hc,
+            r#"#!/bin/sh
+echo '{"terminals":[{"cwd":"/tmp/project","state":"live"},{"cwd":"/tmp/other","state":"finished"}]}'
+"#,
+        )
+        .unwrap();
+        make_executable(&fake_hc);
+
+        // 動いていないプロジェクトのセッション（一覧に出てはいけない）
+        let other = work.join("pi-sessions/--tmp-other--");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join(format!("2026-01-01T00-00-00-000Z_{OTHER_ID}.jsonl")),
+            format!(
+                r#"{{"type":"session","id":"{OTHER_ID}","cwd":"/tmp/other"}}
+{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"止まっているプロジェクトの頼みごと"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_osd-server"))
             .arg("--dir")
             .arg(&work)
@@ -84,6 +109,7 @@ echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":
             .arg("0")
             .env("OSD_PI_BIN", &script)
             .env("OSD_SESSIONS_DIR", &sessions)
+            .env("OSD_HC_BIN", &fake_hc)
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -173,6 +199,11 @@ fn init_ask_return() {
     assert_eq!(code, 200);
     assert!(body.contains("最初の頼みごと"), "一覧に見分けが付く文: {body}");
     assert!(body.contains("\"project\":\"project\""), "cwd から project: {body}");
+    assert!(
+        !body.contains("止まっているプロジェクト"),
+        "動いていないプロジェクトのセッションは出さない: {body}"
+    );
+    assert!(body.contains("\"agents\":1"), "動いているエージェント数: {body}");
 
     // セッション内のアシスタント発言の一覧
     let file = s

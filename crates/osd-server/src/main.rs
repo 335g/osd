@@ -5,6 +5,7 @@
 //! 起動すると `osd: http://127.0.0.1:<port>/?t=<token>` を stdout に出し、同じ URL を
 //! `<作業フォルダ>/url.txt` に書く。GUI はこの URL を叩く。
 
+mod agents;
 mod pi;
 mod sessions;
 
@@ -18,7 +19,7 @@ use axum::{
 };
 use osd_api::{
     Action, AskReq, AskResp, CommentMeta, CommentsResp, DraftReq, InitResp, OkResp, OpenReq,
-    ReturnReq, SessionsResp,
+    ProjectInfo, ReturnReq, SessionsResp,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -192,13 +193,45 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 }
 
 // ---------- ハンドラ ----------
-/// 全セッションの一覧（新しい順）。
+/// いま動いているエージェントのプロジェクトと、そのセッションだけを返す。
 async fn list_sessions() -> Json<SessionsResp> {
     let base = sessions::dir();
     let found = tokio::task::spawn_blocking(move || sessions::list(&base))
         .await
         .unwrap_or_default();
-    Json(SessionsResp { sessions: found })
+    let running = match agents::running().await {
+        Ok(list) => list,
+        // hc が無い・落ちているときは、全プロジェクトを出さずに理由を返す
+        Err(e) => {
+            return Json(SessionsResp {
+                note: format!("動いているエージェントを取れませんでした: {e}"),
+                ..SessionsResp::default()
+            })
+        }
+    };
+    let mut projects = Vec::new();
+    for (cwd, name, count) in &running {
+        let mut mine: Vec<_> = found.iter().filter(|s| &s.cwd == cwd).collect();
+        mine.sort_by(|a, b| b.updated.cmp(&a.updated));
+        projects.push(ProjectInfo {
+            cwd: cwd.clone(),
+            name: name.clone(),
+            agents: *count,
+            sessions: mine.len() as u32,
+            updated: mine.first().map(|s| s.updated).unwrap_or(0),
+        });
+    }
+    // 動いているプロジェクトだけを、セッションが新しい順に
+    projects.sort_by(|a, b| b.updated.cmp(&a.updated));
+    let sessions: Vec<_> = found
+        .into_iter()
+        .filter(|s| running.iter().any(|(cwd, _, _)| cwd == &s.cwd))
+        .collect();
+    Json(SessionsResp {
+        sessions,
+        projects,
+        note: String::new(),
+    })
 }
 
 /// セッション内のアシスタント発言の一覧（一覧に出す分だけ）。

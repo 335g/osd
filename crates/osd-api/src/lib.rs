@@ -113,11 +113,29 @@ pub struct SessionInfo {
     pub preview: String,
 }
 
-/// GET /api/sessions
+/// いま herdr-core で動いているエージェントのプロジェクト。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProjectInfo {
+    pub cwd: String,
+    /// cwd の最後のディレクトリ名
+    pub name: String,
+    /// このプロジェクトで動いているエージェントの数
+    pub agents: u32,
+    /// そのプロジェクトのセッション数
+    pub sessions: u32,
+    /// 一番新しいセッションの更新時刻（Unix ミリ秒）
+    pub updated: u64,
+}
+
+/// GET /api/sessions — 動いているエージェントのプロジェクトと、そのセッションだけ
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SessionsResp {
     pub sessions: Vec<SessionInfo>,
+    pub projects: Vec<ProjectInfo>,
+    /// 一覧を作れなかった理由（空なら問題なし）
+    pub note: String,
 }
 
 /// POST /api/open — 選んだアシスタント発言を本筋にする（index 省略なら最後）

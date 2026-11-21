@@ -35,7 +35,7 @@ osd: http://127.0.0.1:8765/?t=<合言葉>
 | エンドポイント | 入力 | 出力 |
 |---|---|---|
 | `GET /api/init` | — | `{markdown, title, hasSession, project}` |
-| `GET /api/sessions` | — | `{sessions: [{id, file, cwd, project, updated, preview}]}`（新しい順） |
+| `GET /api/sessions` | — | `{sessions, projects, note}`。動いているエージェントのプロジェクトとそのセッションだけ |
 | `POST /api/comments` | `{file}` | `{project, comments: [{index, preview, chars}]}`（そのセッションのアシスタント発言） |
 | `POST /api/open` | `{file, index?}` | `{markdown, ...}`。選んだアシスタント発言を本筋にする（index 省略＝最後） |
 | `POST /api/ask` | `{action, anchor, question}` / `{continueSession, forkFile, followUp}` | `{ok, text, sessionId, forkFile, costUsd}` |
@@ -57,6 +57,8 @@ cargo test -p osd-server
 
 - `OSD_PI_BIN` — `pi` のパス（既定 `pi`）
 - `OSD_TIMEOUT_SEC` — 1 問の待ち時間（既定 300）
+- `OSD_HC_BIN` — `hc` のパス（既定 `hc`）
+- `OSD_SESSIONS_DIR` — セッション置き場（既定 `~/.pi/agent/sessions`）
 
 ## osd-app
 
@@ -66,7 +68,9 @@ cargo run -p osd-app -- --url 'http://127.0.0.1:8765/?t=...'
 cargo run -p osd-app -- --scene note --snap /tmp/osd.png   # ヘッドレスで見た目確認
 ```
 
-左にプロジェクトの一覧（プロジェクト名・セッション数・更新時刻）。プロジェクトを押すと
+左にプロジェクトの一覧（プロジェクト名・動いているエージェント数・セッション数・更新時刻）。
+一覧は全プロジェクトではなく、`hc ls --json`（herdr-core）が返す**いま動いているエージェントの
+プロジェクトだけ**。プロジェクトを押すと
 そのプロジェクトのセッションが下に開き（同時に開くのは 1 つ）、セッションを選ぶと右上に
 そのセッションのアシスタント発言の一覧、右下に選んだ発言の本文が出る。
 
