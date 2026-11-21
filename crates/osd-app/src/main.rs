@@ -26,6 +26,8 @@ fn main() {
 struct St {
     bridge: Option<(String, String)>, // (origin, token)
     sessions: Vec<SessionInfo>,
+    /// 左で開いているプロジェクト（cwd）。そのプロジェクトのセッションだけ並べる
+    expanded: Option<String>,
     /// いま開いているセッションのファイル
     opened: Option<String>,
     /// そのセッションのアシスタント発言（古い順）
@@ -110,6 +112,9 @@ fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
         match msg {
             Msg::Sessions(Ok(list)) => {
                 s.sessions = list.sessions;
+                if s.expanded.is_none() {
+                    s.expanded = s.sessions.first().map(|x| x.cwd.clone());
+                }
                 s.status.clear();
             }
             Msg::Sessions(Err(e)) => s.status = e,
@@ -228,42 +233,87 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
     root(col().w_full().h_full().fill(t.bg).child(header).child(body), vec![])
 }
 
+/// セッションをプロジェクト（cwd）ごとにまとめ、新しい順に並べる。
+fn projects(s: &St) -> Vec<(String, String, Vec<&SessionInfo>)> {
+    let mut out: Vec<(String, String, Vec<&SessionInfo>)> = Vec::new();
+    for session in &s.sessions {
+        match out.iter_mut().find(|(cwd, _, _)| cwd == &session.cwd) {
+            Some((_, _, list)) => list.push(session),
+            None => out.push((session.cwd.clone(), session.project.clone(), vec![session])),
+        }
+    }
+    // どのプロジェクトも先頭が一番新しいセッションなので、その時刻で並べる
+    out.sort_by(|a, b| b.2.first().map(|s| s.updated).cmp(&a.2.first().map(|s| s.updated)));
+    out
+}
+
 fn session_list(s: &St, t: tok::Theme) -> El {
     let mut list = col().w_full().gap(2.0).padding(8.0);
     if s.sessions.is_empty() && s.busy == 0 {
         list = list.child(text("セッションがありません").font(type_::BODY).color(t.text_secondary));
     }
-    for session in &s.sessions {
-        let chosen = s.opened.as_deref() == Some(session.file.as_str());
-        let file = session.file.clone();
+    for (cwd, project, sessions) in projects(s) {
+        let open = s.expanded.as_deref() == Some(cwd.as_str());
+        let cwd_for_toggle = cwd.clone();
+        let newest = sessions.first().map(|s| s.updated).unwrap_or(0);
         list = list.child(
             el()
-                .key(format!("s-{}", session.id))
+                .key(format!("p-{cwd}"))
                 .w_full()
                 .padding(8.0)
                 .radius(6.0)
-                .fill(if chosen { t.hover } else { t.bg })
-                .on_press(move |s: &mut St| s.open_session(file.clone()))
+                .fill(if open { t.hover } else { t.bg })
+                .on_press(move |s: &mut St| {
+                    s.expanded = if s.expanded.as_deref() == Some(cwd_for_toggle.as_str()) {
+                        None
+                    } else {
+                        Some(cwd_for_toggle.clone())
+                    }
+                })
                 .child(
-                    col()
+                    row()
                         .w_full()
-                        .gap(3.0)
+                        .gap(8.0)
+                        .child(text(project).font(type_::LABEL).color(t.text))
                         .child(
-                            row()
-                                .w_full()
-                                .gap(8.0)
-                                .child(text(session.project.clone()).font(type_::LABEL).color(t.text))
-                                .child(text(when(session.updated)).font(type_::LABEL).color(t.text_secondary)),
-                        )
-                        .child(
-                            text(session.preview.clone())
-                                .font(type_::BODY)
-                                .wrap()
-                                .max_lines(2)
+                            text(format!("{}", sessions.len()))
+                                .font(type_::LABEL)
                                 .color(t.text_secondary),
-                        ),
+                        )
+                        .child(text("").grow(1.0))
+                        .child(text(when(newest)).font(type_::LABEL).color(t.text_secondary)),
                 ),
         );
+        if !open {
+            continue;
+        }
+        for session in sessions {
+            let chosen = s.opened.as_deref() == Some(session.file.as_str());
+            let file = session.file.clone();
+            list = list.child(
+                el()
+                    .key(format!("s-{}", session.id))
+                    .w_full()
+                    .padding(6.0)
+                    .px(18.0)
+                    .radius(6.0)
+                    .fill(if chosen { t.hover } else { t.bg })
+                    .on_press(move |s: &mut St| s.open_session(file.clone()))
+                    .child(
+                        col()
+                            .w_full()
+                            .gap(3.0)
+                            .child(text(when(session.updated)).font(type_::LABEL).color(t.text_secondary))
+                            .child(
+                                text(session.preview.clone())
+                                    .font(type_::BODY)
+                                    .wrap()
+                                    .max_lines(2)
+                                    .color(if chosen { t.text } else { t.text_secondary }),
+                            ),
+                    ),
+            );
+        }
     }
     col()
         .key("sessions")
@@ -440,6 +490,7 @@ fn sample(s: &mut St) {
             preview: "このテストが落ちる理由を調べて".into(),
         },
     ];
+    s.expanded = Some("/Users/335g/Dev/osd".into());
     s.opened = Some("/tmp/a.jsonl".into());
     s.comments = vec![
         CommentMeta { index: 0, preview: "まず恒等写像の定義を確認します。".into(), chars: 40 },
