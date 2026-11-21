@@ -27,6 +27,25 @@ impl Server {
         std::fs::write(work.join("main.md"), "# 本筋\n\n本文です。\n").unwrap();
         std::fs::write(work.join("title.txt"), "テスト\n").unwrap();
 
+        // 見本のセッション置き場（本物の ~/.pi を触らずに一覧と open を試す）
+        let sessions = work.join("pi-sessions");
+        let slug = sessions.join("--tmp-project--");
+        std::fs::create_dir_all(&slug).unwrap();
+        let big = "x".repeat(40_000);
+        std::fs::write(
+            slug.join(format!("2026-01-01T00-00-00-000Z_{SESSION_ID}.jsonl")),
+            format!(
+                r#"{{"type":"session","id":"{SESSION_ID}","cwd":"/tmp/project"}}
+{{"type":"message","message":{{"role":"system","content":"{big}"}}}}
+{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"最初の頼みごと"}}]}}}}
+{{"type":"message","message":{{"role":"assistant","content":[{{"type":"text","text":"古い答え"}}]}}}}
+{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"次の頼みごと"}}]}}}}
+{{"type":"message","message":{{"role":"assistant","content":[{{"type":"text","text":"最後の答え"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+
         // 偽の pi: 引数を記録し、--session-dir にフォークのファイルを作り、pi --mode json と同じ形のイベントを吐く
         let script = work.join("fake-pi.sh");
         std::fs::write(
@@ -64,6 +83,7 @@ echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":
             .arg("--port")
             .arg("0")
             .env("OSD_PI_BIN", &script)
+            .env("OSD_SESSIONS_DIR", &sessions)
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -148,6 +168,35 @@ fn init_ask_return() {
     let (code, _) = s.call("GET", "/api/init", "wrong", "");
     assert_eq!(code, 403, "合言葉が違えば断る");
 
+    // セッション一覧: 最初のユーザー発言を添えて返す
+    let (code, body) = s.call("GET", "/api/sessions", &s.token, "");
+    assert_eq!(code, 200);
+    assert!(body.contains("最初の頼みごと"), "一覧に見分けが付く文: {body}");
+    assert!(body.contains("\"project\":\"project\""), "cwd から project: {body}");
+
+    // 選んだセッションの最後のアシスタント発言を本筋にする
+    let file = s
+        .work
+        .join("pi-sessions/--tmp-project--")
+        .join(format!("2026-01-01T00-00-00-000Z_{SESSION_ID}.jsonl"));
+    let body_req = format!(r#"{{"file":"{}"}}"#, file.display());
+    let (code, body) = s.call("POST", "/api/open", &s.token, &body_req);
+    assert_eq!(code, 200);
+    assert!(body.contains("最後の答え"), "最後の発言を返す: {body}");
+    assert_eq!(
+        std::fs::read_to_string(s.work.join("main.md")).unwrap().trim(),
+        "最後の答え"
+    );
+
+    // 置き場の外は読ませない
+    let (_, body) = s.call(
+        "POST",
+        "/api/open",
+        &s.token,
+        r#"{"file":"/etc/passwd"}"#,
+    );
+    assert!(body.contains("ありません"), "置き場の外は断る: {body}");
+
     let (code, body) = s.call(
         "POST",
         "/api/ask",
@@ -161,7 +210,12 @@ fn init_ask_return() {
     assert!(body.contains("forkFile"), "続きの質問用のファイル: {body}");
 
     let argv = std::fs::read_to_string(s.work.join("argv.txt")).unwrap();
-    assert!(argv.contains("--fork\nparent.jsonl"), "本体から分岐する: {argv}");
+    // /api/open で本筋にしたセッションから分岐する（サーバは実パスに直して覚える）
+    let canonical = std::fs::canonicalize(&file).unwrap();
+    assert!(
+        argv.contains(&format!("--fork\n{}", canonical.display())),
+        "選んだセッションから分岐する: {argv}"
+    );
     assert!(argv.contains("--session-dir"), "フォークは作業フォルダに置く");
     assert!(argv.contains("bash,edit,write"), "編集系の道具を外す");
     assert!(argv.contains("対象の文"), "選んだ文がプロンプトに入る");

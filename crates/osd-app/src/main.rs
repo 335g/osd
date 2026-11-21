@@ -1,12 +1,13 @@
-//! osd の GUI。ブリッジ API（osd-server）を叩いて、本筋と付箋を描く。
+//! osd の GUI。ブリッジ API（osd-server）からセッション一覧を取り、選んだセッションの
+//! 最後のアシスタント発言を「対象の AI コメント」として表示する。
 //!
 //! 使い方: osd-app [--url http://127.0.0.1:8765/?t=...] [--dir <作業フォルダ>]
 //! `--url` も `--dir` も無ければ `OSD_URL`、次にカレントの `url.txt` を読む。
 
-use osd_api::{Action, AskReq, AskResp, InitResp};
+use osd_api::{InitResp, OpenReq, SessionInfo, SessionsResp};
 use rune::tok::{self, type_};
-use rune::{AppSpec, Cx, El, ScrollSpec, TextEdit, Tx, Waker, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, Kit, Markdown, TextArea, root};
+use rune::{AppSpec, Cx, El, ScrollSpec, Tx, Waker, col, el, row, text};
+use rune_kit::{Kit, Markdown, root};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -15,80 +16,39 @@ fn main() {
     rune::run(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
-        scenes: &[("note", sample_note), ("ask", sample_ask)],
+        scenes: &[("sample", sample)],
         ..AppSpec::new("osd", (1100.0, 760.0), init, view)
     });
 }
 
 // ---------- 状態 ----------
-struct Note {
-    id: u32,
-    anchor: String,
-    label: &'static str,
-    answer: String,
-    fork_file: String,
-    pending: bool,
-    err: String,
-    follow: TextEdit,
-}
-
+#[derive(Default)]
 struct St {
     bridge: Option<(String, String)>, // (origin, token)
+    sessions: Vec<SessionInfo>,
+    /// いま表示しているセッションのファイル
+    opened: Option<String>,
     project: String,
-    blocks: Vec<String>,
-    selected: Option<usize>,
-    notes: Vec<Note>,
-    next_note: u32,
-    question: TextEdit,
-    ret: TextEdit,
+    markdown: String,
     status: String,
-    tx: Sender<Msg>,
-    rx: Receiver<Msg>,
+    tx: Option<Sender<Msg>>,
+    rx: Option<Receiver<Msg>>,
     waker: Option<Waker>,
     busy: usize,
 }
 
 enum Msg {
-    Init(Result<InitResp, String>),
-    Ask(u32, Result<AskResp, String>),
-    Draft(Result<AskResp, String>),
-    Closed(Result<(), String>),
-}
-
-impl St {
-    fn send(&self, job: impl FnOnce() -> Msg + Send + 'static) {
-        let (tx, waker) = (self.tx.clone(), self.waker.clone());
-        std::thread::spawn(move || {
-            let msg = job();
-            let _ = tx.send(msg);
-            if let Some(wake) = waker {
-                wake();
-            }
-        });
-    }
-
-    fn note(&self, id: u32) -> Option<&Note> {
-        self.notes.iter().find(|n| n.id == id)
-    }
+    Sessions(Result<SessionsResp, String>),
+    Opened(Result<InitResp, String>),
 }
 
 fn init() -> St {
-    let url = bridge_url();
     let (tx, rx) = channel();
     St {
-        bridge: url,
-        project: String::new(),
-        blocks: Vec::new(),
-        selected: None,
-        notes: Vec::new(),
-        next_note: 1,
-        question: TextEdit::new(""),
-        ret: TextEdit::new(""),
-        status: String::new(),
-        tx,
-        rx,
-        waker: None,
-        busy: 0,
+        bridge: bridge_url(),
+        tx: Some(tx),
+        rx: Some(rx),
+        ..St::default()
     }
 }
 
@@ -118,100 +78,73 @@ fn bridge_url() -> Option<(String, String)> {
     Some((origin.to_owned(), token.to_owned()))
 }
 
-/// ヘッドレスで付箋の見た目を確認するための見本（ブリッジには繋がない）。
-fn sample_note(s: &mut St) {
-    s.bridge = None;
-    s.project = "見本".into();
-    s.blocks = split_blocks(
-        "## 恒等写像とは\n\n`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。\n\n```mermaid\nflowchart LR\n  A[\"入力 x\"] --> B[\"id\"] --> C[\"出力 x\"]\n```",
-    );
-    s.selected = Some(0);
-    s.notes.push(Note {
-        id: 1,
-        anchor: "`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。".into(),
-        label: "図",
-        answer: "処理の流れは一直線です。受け取った値をそのまま返すので、途中に変換も副作用もありません。\n\n```mermaid\nflowchart LR\n  A[\"入力\"] --> B[\"id\"] --> C[\"出力\"]\n```".into(),
-        fork_file: String::new(),
-        pending: false,
-        err: String::new(),
-        follow: TextEdit::new(""),
-    });
-}
-
-/// ヘッドレスで往復を確認するための見本（1 問だけ投げる）。
-fn sample_ask(s: &mut St) {
-    s.project = "見本".into();
-    s.blocks = split_blocks("## 恒等写像とは\n\n`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。");
-    if s.bridge.is_some() {
-        start_note(s, Action::Detail, s.blocks[1].clone(), String::new());
-    }
-}
-
 fn setup(s: &mut St, waker: Waker) {
     s.waker = Some(waker);
-    let Some((origin, token)) = s.bridge.clone() else {
+    if s.bridge.is_none() {
         s.status = "ブリッジの URL がありません（--url か --dir で渡してください）".into();
         return;
-    };
+    }
     s.busy += 1;
-    s.send(move || Msg::Init(http(&origin, &token, "GET", "/api/init", None).and_then(|b| {
-        serde_json::from_str::<InitResp>(&b).map_err(|e| format!("応答を読めません: {e}"))
-    })));
+    s.send(|origin, token| {
+        Msg::Sessions(http(&origin, &token, "GET", "/api/sessions", None).and_then(|b| {
+            serde_json::from_str::<SessionsResp>(&b).map_err(|e| format!("応答を読めません: {e}"))
+        }))
+    });
 }
 
 fn poll(s: &mut St, _t: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
-    while let Ok(msg) = s.rx.try_recv() {
+    let Some(rx) = &s.rx else { return false };
+    while let Ok(msg) = rx.try_recv() {
         changed = true;
+        s.busy = s.busy.saturating_sub(1);
         match msg {
-            Msg::Init(Ok(init)) => {
-                s.project = if init.title.is_empty() { init.project } else { init.title };
-                s.blocks = split_blocks(&init.markdown);
-                s.selected = None;
-                s.busy = s.busy.saturating_sub(1);
+            Msg::Sessions(Ok(list)) => {
+                s.sessions = list.sessions;
+                s.status.clear();
             }
-            Msg::Init(Err(e)) => {
-                s.status = e;
-                s.busy = s.busy.saturating_sub(1);
+            Msg::Sessions(Err(e)) => s.status = e,
+            Msg::Opened(Ok(init)) => {
+                s.project = init.project;
+                s.markdown = init.markdown;
+                s.status.clear();
             }
-            Msg::Ask(id, res) => {
-                s.busy = s.busy.saturating_sub(1);
-                if let Some(n) = s.notes.iter_mut().find(|n| n.id == id) {
-                    n.pending = false;
-                    match res {
-                        Ok(a) if a.ok => {
-                            n.answer = a.text;
-                            n.fork_file = a.fork_file;
-                            n.err.clear();
-                        }
-                        Ok(a) => n.err = a.error,
-                        Err(e) => n.err = e,
-                    }
-                }
-            }
-            Msg::Draft(res) => {
-                s.busy = s.busy.saturating_sub(1);
-                match res {
-                    Ok(a) if a.ok => s.ret = TextEdit::new(a.text.trim()),
-                    Ok(a) => s.status = a.error,
-                    Err(e) => s.status = e,
-                }
-            }
-            Msg::Closed(res) => {
-                s.busy = s.busy.saturating_sub(1);
-                match res {
-                    Ok(()) => tx.quit(),
-                    Err(e) => s.status = e,
-                }
-            }
+            Msg::Opened(Err(e)) => s.status = e,
         }
     }
-    // 待っている間は時計を進めて、画面が固まって見えないようにする
     if s.busy > 0 {
         tx.wake_after(std::time::Duration::from_millis(200));
         changed = true;
     }
     changed
+}
+
+impl St {
+    /// HTTP はスレッドで走らせ、終わったら channel で受けて waker で画面を起こす。
+    fn send(&self, job: impl FnOnce(String, String) -> Msg + Send + 'static) {
+        let (Some(bridge), Some(tx), waker) = (self.bridge.clone(), self.tx.clone(), self.waker.clone())
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let _ = tx.send(job(bridge.0, bridge.1));
+            if let Some(wake) = waker {
+                wake();
+            }
+        });
+    }
+
+    fn open(&mut self, file: String) {
+        self.opened = Some(file.clone());
+        self.busy += 1;
+        let body = serde_json::to_string(&OpenReq { file }).unwrap_or_default();
+        self.send(move |origin, token| {
+            Msg::Opened(
+                http(&origin, &token, "POST", "/api/open", Some(&body))
+                    .and_then(|b| serde_json::from_str::<InitResp>(&b).map_err(|e| e.to_string())),
+            )
+        });
+    }
 }
 
 // ---------- 見た目 ----------
@@ -231,9 +164,9 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
         .fill(t.card)
         .child(text(format!("osd · {}", s.project)).font(type_::LABEL).color(t.text))
         .child(
-            text(if s.busy > 0 { "考えています…" } else { s.status.as_str() })
+            text(if s.busy > 0 { "読み込んでいます…" } else { s.status.as_str() })
                 .font(type_::LABEL)
-                .color(if s.status.is_empty() { t.text_secondary } else { t.text }),
+                .color(t.text_secondary),
         );
 
     let body = row()
@@ -242,312 +175,91 @@ fn view(s: &St, _: &mut Cx<St>) -> El {
         .min_h(0.0)
         .gap(1.0)
         .fill(t.separator)
-        .child(main_pane(s, &k, t))
-        .child(side_pane(s, &k, t));
+        .child(session_list(s, t))
+        .child(comment_pane(s, &k, t));
 
     root(col().w_full().h_full().fill(t.bg).child(header).child(body), vec![])
 }
 
-fn main_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
-    let mut list = col().w_full().gap(2.0).padding(12.0);
-    for (i, block) in s.blocks.iter().enumerate() {
-        let chosen = s.selected == Some(i);
+fn session_list(s: &St, t: tok::Theme) -> El {
+    let mut list = col().w_full().gap(2.0).padding(8.0);
+    if s.sessions.is_empty() && s.busy == 0 {
+        list = list.child(text("セッションがありません").font(type_::BODY).color(t.text_secondary));
+    }
+    for session in &s.sessions {
+        let chosen = s.opened.as_deref() == Some(session.file.as_str());
+        let file = session.file.clone();
         list = list.child(
             el()
-                .key(format!("blk-{i}"))
+                .key(format!("s-{}", session.id))
                 .w_full()
                 .padding(8.0)
                 .radius(6.0)
-                .fill(if chosen { t.card } else { t.bg })
-                .on_press(move |s: &mut St| s.selected = Some(i))
-                .child(Markdown::new(block.clone()).selectable(true).build(k)),
+                .fill(if chosen { t.hover } else { t.bg })
+                .on_press(move |s: &mut St| s.open(file.clone()))
+                .child(
+                    col()
+                        .w_full()
+                        .gap(3.0)
+                        .child(
+                            row()
+                                .w_full()
+                                .gap(8.0)
+                                .child(text(session.project.clone()).font(type_::LABEL).color(t.text))
+                                .child(text(when(session.updated)).font(type_::LABEL).color(t.text_secondary)),
+                        )
+                        .child(
+                            text(session.preview.clone())
+                                .font(type_::BODY)
+                                .color(t.text_secondary),
+                        ),
+                ),
         );
     }
-    if s.blocks.is_empty() && s.busy == 0 {
-        list = list.child(text("本筋がありません").font(type_::BODY).color(t.text_secondary));
-    }
     col()
-        .key("main")
+        .key("sessions")
+        .w(380.0)
+        .h_full()
+        .min_h(0.0)
+        .fill(t.bg)
+        .child(list.scroll(ScrollSpec { stick_bottom: false }))
+}
+
+fn comment_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
+    let body = if s.markdown.is_empty() {
+        col().padding(16.0).child(
+            text("左からセッションを選ぶと、最後のアシスタント発言が出ます")
+                .font(type_::BODY)
+                .color(t.text_secondary),
+        )
+    } else {
+        col()
+            .w_full()
+            .padding(16.0)
+            .child(Markdown::new(s.markdown.clone()).selectable(true).build(k))
+    };
+    col()
+        .key("comment")
         .grow(1.0)
         .h_full()
         .min_h(0.0)
         .min_w(0.0)
         .fill(t.bg)
-        .child(list.scroll(ScrollSpec { stick_bottom: false }))
+        .child(body.scroll(ScrollSpec { stick_bottom: false }))
 }
 
-fn side_pane(s: &St, k: &Kit, t: tok::Theme) -> El {
-    let mut panel = col().w_full().gap(10.0).padding(12.0);
-
-    if let Some(i) = s.selected {
-        let anchor = s.blocks.get(i).cloned().unwrap_or_default();
-        panel = panel.child(composer(s, k, t, anchor));
-    }
-
-    for note in &s.notes {
-        panel = panel.child(note_card(note, k, t));
-    }
-
-    panel = panel.child(
-        col()
-            .w_full()
-            .gap(6.0)
-            .padding(10.0)
-            .radius(8.0)
-            .fill(t.card)
-            .child(text("本筋に返す文").font(type_::LABEL).color(t.text))
-            .child(
-                TextArea::new(&s.ret)
-                    .placeholder("理解したことと、本筋に反映してほしい点")
-                    .rows(3)
-                    .on_edit(|s: &mut St| &mut s.ret)
-                    .build(k),
-            )
-            .child(
-                row().gap(8.0).child(
-                    Button::new("下書きを作る")
-                        .variant(ButtonVariant::Neutral)
-                        .on_press(|s: &mut St| draft(s))
-                        .build(k),
-                ),
-            )
-            .child(
-                Button::new("返して閉じる")
-                    .variant(ButtonVariant::Contrast)
-                    .on_press(|s: &mut St| close(s))
-                    .build(k),
-            ),
-    );
-
-    col()
-        .key("side")
-        .w(420.0)
-        .h_full()
-        .min_h(0.0)
-        .fill(t.bg)
-        .child(panel.scroll(ScrollSpec { stick_bottom: false }))
-}
-
-fn composer(s: &St, k: &Kit, t: tok::Theme, anchor: String) -> El {
-    let plain = plain_text(&anchor);
-    let preview = if plain.chars().count() > 160 {
-        plain.chars().take(160).collect::<String>() + "…"
-    } else {
-        plain
-    };
-    let mut actions = row().gap(6.0);
-    for (label, action) in [
-        ("詳しく", Action::Detail),
-        ("用語", Action::Term),
-        ("図", Action::Diagram),
-        ("レビュー", Action::Review),
-    ] {
-        let anchor = anchor.clone();
-        actions = actions.child(
-            Button::new(label)
-                .variant(ButtonVariant::Neutral)
-                .on_press(move |s: &mut St| {
-                    start_note(s, action, anchor.clone(), String::new());
-                    s.selected = None;
-                })
-                .build(k),
-        );
-    }
-    let anchor_for_send = anchor.clone();
-
-    col()
-        .w_full()
-        .gap(8.0)
-        .padding(10.0)
-        .radius(8.0)
-        .fill(t.card)
-        .child(text(preview).font(type_::LABEL).color(t.text_secondary))
-        .child(actions)
-        .child(
-            TextArea::new(&s.question)
-                .placeholder("この部分について質問する")
-                .rows(2)
-                .on_edit(|s: &mut St| &mut s.question)
-                .build(k),
-        )
-        .child(
-            Button::new("質問する")
-                .variant(ButtonVariant::Contrast)
-                .on_press(move |s: &mut St| {
-                    let q = s.question.text.trim().to_owned();
-                    start_note(s, Action::Question, anchor_for_send.clone(), q);
-                    s.question = TextEdit::new("");
-                    s.selected = None;
-                })
-                .build(k),
-        )
-}
-
-fn note_card(note: &Note, k: &Kit, t: tok::Theme) -> El {
-    let id = note.id;
-    let mut card = col()
-        .key(format!("note-{id}"))
-        .w_full()
-        .gap(8.0)
-        .padding(10.0)
-        .radius(8.0)
-        .fill(t.card)
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(text(note.label).font(type_::LABEL).color(tok::accent(0, true)))
-                .child(text("").grow(1.0)),
-        );
-
-    if note.pending {
-        card = card.child(text("考えています…").font(type_::BODY).color(t.text_secondary));
-    }
-    if !note.err.is_empty() {
-        card = card.child(text(note.err.clone()).font(type_::BODY).color(t.text));
-    }
-    if !note.answer.is_empty() {
-        card = card.child(Markdown::new(note.answer.clone()).selectable(true).build(k));
-    }
-
-    card.child(
-        row()
-            .w_full()
-            .gap(6.0)
-            .child(
-                TextArea::new(&note.follow)
-                    .placeholder("続けて聞く")
-                    .rows(1)
-                    .on_edit(move |s: &mut St| &mut s.notes.iter_mut().find(|n| n.id == id).unwrap().follow)
-                    .build(k)
-                    .grow(1.0),
-            )
-            .child(
-                Button::new("送る")
-                    .variant(ButtonVariant::Neutral)
-                    .on_press(move |s: &mut St| follow_up(s, id))
-                    .build(k),
-            ),
-    )
-}
-
-// ---------- 操作 ----------
-fn start_note(s: &mut St, action: Action, anchor: String, question: String) {
-    let id = s.next_note;
-    s.next_note += 1;
-    s.notes.push(Note {
-        id,
-        anchor: anchor.clone(),
-        label: label_of(action),
-        answer: String::new(),
-        fork_file: String::new(),
-        pending: true,
-        err: String::new(),
-        follow: TextEdit::new(""),
-    });
-    let Some((origin, token)) = s.bridge.clone() else {
-        if let Some(n) = s.notes.iter_mut().find(|n| n.id == id) {
-            n.pending = false;
-            n.err = "ブリッジに繋がっていません".into();
-        }
-        return;
-    };
-    let body = serde_json::to_string(&AskReq {
-        action,
-        anchor,
-        question,
-        ..AskReq::default()
-    })
-    .unwrap_or_default();
-    s.busy += 1;
-    s.send(move || {
-        Msg::Ask(
-            id,
-            http(&origin, &token, "POST", "/api/ask", Some(&body))
-                .and_then(|b| serde_json::from_str::<AskResp>(&b).map_err(|e| e.to_string())),
-        )
-    });
-}
-
-fn follow_up(s: &mut St, id: u32) {
-    let Some(note) = s.note(id) else { return };
-    let (text, fork_file) = (note.follow.text.trim().to_owned(), note.fork_file.clone());
-    if text.is_empty() {
-        return;
-    }
-    let Some((origin, token)) = s.bridge.clone() else { return };
-    let body = serde_json::to_string(&AskReq {
-        follow_up: text,
-        continue_session: !fork_file.is_empty(),
-        fork_file,
-        ..AskReq::default()
-    })
-    .unwrap_or_default();
-    if let Some(n) = s.notes.iter_mut().find(|n| n.id == id) {
-        n.pending = true;
-        n.follow = TextEdit::new("");
-    }
-    s.busy += 1;
-    s.send(move || {
-        Msg::Ask(
-            id,
-            http(&origin, &token, "POST", "/api/ask", Some(&body))
-                .and_then(|b| serde_json::from_str::<AskResp>(&b).map_err(|e| e.to_string())),
-        )
-    });
-}
-
-fn draft(s: &mut St) {
-    let Some((origin, token)) = s.bridge.clone() else { return };
-    let mut notes = String::new();
-    for n in &s.notes {
-        if !n.answer.is_empty() {
-            notes.push_str(&format!("## {}\n{}\n\n", n.anchor, n.answer));
-        }
-    }
-    if notes.trim().is_empty() {
-        s.status = "先に付箋で理解を進めてください".into();
-        return;
-    }
-    let body = serde_json::to_string(&serde_json::json!({ "notes": notes })).unwrap_or_default();
-    s.busy += 1;
-    s.send(move || {
-        Msg::Draft(
-            http(&origin, &token, "POST", "/api/draft", Some(&body))
-                .and_then(|b| serde_json::from_str::<AskResp>(&b).map_err(|e| e.to_string())),
-        )
-    });
-}
-
-fn close(s: &mut St) {
-    let Some((origin, token)) = s.bridge.clone() else { return };
-    let body =
-        serde_json::to_string(&serde_json::json!({ "text": s.ret.text })).unwrap_or_default();
-    s.busy += 1;
-    s.send(move || {
-        Msg::Closed(
-            http(&origin, &token, "POST", "/api/return", Some(&body)).map(|_| ()),
-        )
-    });
-}
-
-/// 付箋に貼る見出し用に、記号を落として1行にまとめる。
-fn plain_text(md: &str) -> String {
-    md.lines()
-        .map(|l| l.trim_start_matches(['#', '>', '-', ' ']).replace(['`', '*'], ""))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_owned()
-}
-
-fn label_of(action: Action) -> &'static str {
-    match action {
-        Action::Question => "質問",
-        Action::Detail => "詳しく",
-        Action::Term => "用語",
-        Action::Diagram => "図",
-        Action::Review => "レビュー",
+/// 更新時刻を「いま / N分前 / N時間前 / N日前」に。
+fn when(ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ago = now.saturating_sub(ms) / 1000;
+    match ago {
+        0..=59 => "いま".to_string(),
+        60..=3599 => format!("{}分前", ago / 60),
+        3600..=86399 => format!("{}時間前", ago / 3600),
+        _ => format!("{}日前", ago / 86400),
     }
 }
 
@@ -584,61 +296,49 @@ fn http(origin: &str, token: &str, method: &str, path: &str, body: Option<&str>)
     Ok(body.to_owned())
 }
 
-// ---------- 本筋を付箋の単位に切る ----------
-/// 空行で区切る。ただしコードフェンスの中は切らない（mermaid やコードを割らないため）。
-fn split_blocks(md: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut fence = false;
-    for line in md.lines() {
-        if line.trim_start().starts_with("```") {
-            fence = !fence;
-        }
-        if line.trim().is_empty() && !fence {
-            if !cur.trim().is_empty() {
-                out.push(cur.trim_end().to_owned());
-                cur.clear();
-            }
-            continue;
-        }
-        cur.push_str(line);
-        cur.push('\n');
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim_end().to_owned());
-    }
-    out
+// ---------- 見た目を確かめるための見本 ----------
+fn sample(s: &mut St) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    s.project = "osd".into();
+    s.sessions = vec![
+        SessionInfo {
+            id: "01a1fd24".into(),
+            file: "/tmp/a.jsonl".into(),
+            cwd: "/Users/335g/Dev/osd".into(),
+            project: "osd".into(),
+            updated: now,
+            preview: "APIサーバーはaxumですかね".into(),
+        },
+        SessionInfo {
+            id: "01a1fcdd".into(),
+            file: "/tmp/b.jsonl".into(),
+            cwd: "/Users/335g/Dev/ghq/github.com/335g/tuit".into(),
+            project: "tuit".into(),
+            updated: now - 3_600_000,
+            preview: "このテストが落ちる理由を調べて".into(),
+        },
+    ];
+    s.opened = Some("/tmp/a.jsonl".into());
+    s.markdown = "## 恒等写像とは\n\n`fn id<T>(x: T) -> T { x }` は入力をそのまま返す関数です。\n\n```mermaid\nflowchart LR\n  A[\"入力 x\"] --> B[\"id\"] --> C[\"出力 x\"]\n```\n\n| 用途 | 例 |\n|---|---|\n| 既定値 | `unwrap_or_else` |\n".into();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blocks_break_on_blank_lines() {
-        let md = "一段落目。\n続き。\n\n二段落目。\n";
-        assert_eq!(split_blocks(md), vec!["一段落目。\n続き。", "二段落目。"]);
-    }
-
-    #[test]
-    fn blocks_keep_fences_whole() {
-        let md = "説明。\n\n```mermaid\nflowchart LR\n  A --> B\n\n  B --> C\n```\n\n最後。";
-        let blocks = split_blocks(md);
-        assert_eq!(blocks.len(), 3, "{blocks:?}");
-        assert!(blocks[1].starts_with("```mermaid"), "{blocks:?}");
-        assert!(blocks[1].ends_with("```"), "{blocks:?}");
-    }
+    use std::io::BufRead;
 
     #[test]
     fn http_talks_to_a_local_server() {
-        use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut head = String::new();
             let mut len = 0;
             loop {
@@ -655,7 +355,6 @@ mod tests {
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).unwrap();
             assert!(head.contains("X-Osd-Token: abc"), "{head}");
-            let mut stream = stream;
             let out = r#"{"ok":true}"#;
             write!(
                 stream,
@@ -666,9 +365,26 @@ mod tests {
             .unwrap();
         });
 
-        let body = r#"{"text":"x"}"#;
-        let got = http(&format!("http://{addr}"), "abc", "POST", "/api/return", Some(body)).unwrap();
+        let got = http(
+            &format!("http://{addr}"),
+            "abc",
+            "POST",
+            "/api/open",
+            Some(r#"{"file":"/tmp/a.jsonl"}"#),
+        )
+        .unwrap();
         assert_eq!(got, r#"{"ok":true}"#);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn when_says_relative_time() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(when(now), "いま");
+        assert_eq!(when(now - 120_000), "2分前");
+        assert_eq!(when(now - 7_200_000), "2時間前");
     }
 }

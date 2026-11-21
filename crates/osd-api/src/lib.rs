@@ -95,3 +95,34 @@ pub struct OkResp {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
 }
+
+/// リストに出す 1 セッション分の情報。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionInfo {
+    /// セッション ID（ファイル名の末尾 `_<id>.jsonl`）
+    pub id: String,
+    /// セッションファイルの絶対パス。`/api/open` に渡す
+    pub file: String,
+    pub cwd: String,
+    /// cwd の最後のディレクトリ名
+    pub project: String,
+    /// 更新時刻（Unix ミリ秒）
+    pub updated: u64,
+    /// 最初のユーザー発言（何を頼んだセッションか分かるように）
+    pub preview: String,
+}
+
+/// GET /api/sessions
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionsResp {
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// POST /api/open — 選んだセッションの最後のアシスタント発言を本筋にする
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenReq {
+    pub file: String,
+}
