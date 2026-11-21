@@ -1,3 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/osd-api", "crates/osd-server"]
+members = ["crates/osd-api", "crates/osd-server", "crates/osd-app"]
+
+# rune の README「Depending on Rune」に従い、同じ rev で patch する（Cargo は依存先の patch を継承しない）
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }

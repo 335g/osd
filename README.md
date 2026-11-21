@@ -11,7 +11,7 @@ AI の長い回答を、付箋と図で噛み砕いて理解するためのネ�
 |---|---|
 | `crates/osd-api` | ブリッジ API の型（サーバと GUI で共有） |
 | `crates/osd-server` | ブリッジ API サーバ。`pi` をフォークして付箋の質問に答える |
-| `crates/osd-app`（未着手） | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)） |
+| `crates/osd-app` | Rust 製 GUI（[rune](https://github.com/anomalyco/rune)）。まだ骨組み |
 
 ## osd-server
 
@@ -54,3 +54,13 @@ cargo test -p osd-server
 
 - `OSD_PI_BIN` — `pi` のパス（既定 `pi`）
 - `OSD_TIMEOUT_SEC` — 1 問の待ち時間（既定 300）
+
+## osd-app
+
+```sh
+cargo run -p osd-app            # ウィンドウ
+cargo run -p osd-app -- --snap /tmp/osd.png   # ヘッドレスで PNG 確認
+```
+
+rune は pre-release なので rev を固定する。`Cargo.toml` の `[patch.crates-io]` は rune の
+README「Depending on Rune」の指示どおり、rune と同じ rev で揃えている（更新時は両方まとめて）。
