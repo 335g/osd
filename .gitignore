@@ -1,0 +1,12 @@
+# 基本は全て管理しない
+*
+
+# 明らかに管理すべきでないものは明示的にも拒否しておく
+node_modules
+target
+.env
+
+CONTEXT.md
+
+# 管理するもの
+!.gitignore
