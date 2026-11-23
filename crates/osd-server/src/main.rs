@@ -11,12 +11,13 @@ mod sessions;
 
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use include_dir::{include_dir, Dir};
 use osd_api::{
     Action, AskReq, AskResp, CommentMeta, CommentsResp, DraftReq, InitResp, OkResp, OpenReq,
     ReturnReq,
@@ -152,6 +153,9 @@ async fn run() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 白板 UI の静的ファイル。バイナリに埋め込む（cargo install しても動くように）。
+static PUBLIC: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/public");
+
 fn routes(app: Arc<App>) -> Router {
     Router::new()
         .route("/api/init", get(init))
@@ -161,7 +165,33 @@ fn routes(app: Arc<App>) -> Router {
         .route("/api/draft", post(draft))
         .route("/api/return", post(close))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
+        .fallback(static_file)
         .with_state(app)
+}
+
+/// 合言葉なしで配る白板 UI。/api 以外はここに来る。
+async fn static_file(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match PUBLIC.get_file(path) {
+        Some(file) => (
+            [(header::CONTENT_TYPE, content_type(path))],
+            file.contents(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
 }
 
 // ---------- 認証 ----------
@@ -343,10 +373,10 @@ async fn draft(State(app): State<Arc<App>>, Json(body): Json<DraftReq>) -> Json<
         return Json(AskResp::err("本体のセッションが見つかりません。"));
     };
     let prompt = [
-        "以下は、ユーザーがAIの出力（本筋）を理解する過程で「本筋に影響あり」とした寄り道のメモです。",
-        "これをもとに、メインの作業セッションのAIに返す短いメッセージを、ユーザーの一人称で下書きしてください。",
-        "形式：1行目に理解できたことを一言、その後に本筋に反映してほしい点を番号付きで。各点は根拠を一文添える。全体で8行以内。",
-        "前置きや説明は書かず、メッセージ本文だけを出力すること。",
+        "以下は、ユーザーがAIの出力（本筋）を理解するために交わした、付箋での質問と回答の記録です。",
+        "これを読んで、メインの作業セッションに送る「次のプロンプト」をユーザーの一人称で書いてください。",
+        "内容は2段落：(1) やりとりで理解・確定したことの要約（箇条書きで最大5点）、(2) それを踏まえて次にやってもらいたいこと（具体的に1〜3点）。",
+        "前置きや説明は書かず、プロンプト本文だけを出力すること。",
         "",
         &body.notes,
     ]

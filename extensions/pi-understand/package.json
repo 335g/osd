@@ -1,0 +1,32 @@
+{
+  "name": "@335g/pi-understand",
+  "version": "0.1.0",
+  "description": "Pi extension: /understand opens the last assistant answer on an osd whiteboard and sends the summary back to the session",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "understand",
+    "osd"
+  ],
+  "author": "Yoshiki Kudo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/335g/osd.git",
+    "directory": "extensions/pi-understand"
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

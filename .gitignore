@@ -13,5 +13,9 @@ CONTEXT.md
 !Cargo.toml
 !Cargo.lock
 !README.md
+!LICENSE
 !crates/
 !crates/**
+!package.json
+!extensions/
+!extensions/**
